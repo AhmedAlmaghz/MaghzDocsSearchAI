@@ -222,9 +222,9 @@ async function walk(dir: string, parentPath?: string): Promise<WalkEntry[]> {
 }
 
 abstract class BaseEmbeddingSource {
-  checksum?: string,
-  meta?: Meta,
-  sections?: Section[],
+  checksum?: string;
+  meta?: Meta;
+  sections?: Section[];
 
   constructor(public source: string, public path: string, public parentPath?: string) {}
 

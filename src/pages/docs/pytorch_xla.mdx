@@ -1,0 +1,2811 @@
+# PyTorch على أجهزة XLA - وثائق PyTorch/XLA الرئيسية
+يعمل PyTorch على أجهزة XLA، مثل وحدات TPU، باستخدام حزمة [torch_xla](https://github.com/pytorch/xla/). تصف هذه الوثيقة كيفية تشغيل نماذجك على هذه الأجهزة.
+
+إنشاء Tensor XLA
+------------------------------------------------------------------------------
+
+يضيف PyTorch/XLA نوع جهاز XLA جديد إلى PyTorch. يعمل نوع الجهاز هذا تمامًا مثل أنواع أجهزة PyTorch الأخرى. على سبيل المثال، إليك كيفية إنشاء Tensor XLA وطباعته:
+
+```py
+import torch
+import torch _xla
+import torch _xla.core.xla_model as xm
+
+t = torch.randn(2، 2، device= xm.xla_device())
+print(t.device)
+print(t)
+
+```
+
+
+يجب أن تبدو هذه التعليمات البرمجية مألوفة. يستخدم PyTorch/XLA نفس واجهة PyTorch العادية مع بعض الإضافات. يؤدي import `torch_xla` إلى تهيئة PyTorch/XLA، ويعيد `xm.xla_device()` جهاز XLA الحالي. قد يكون هذا جهاز CPU أو TPU حسب بيئتك.
+
+تنسورات XLA هي تنسورات PyTorch
+------------------------------------------------------------------------------------------------
+
+يمكن إجراء عمليات PyTorch على تنسورات XLA تمامًا مثل تنسورات CPU أو CUDA.
+
+على سبيل المثال، يمكن إضافة تنسورات XLA معًا:
+
+```py
+t0 = torch.randn(2، 2، device= xm.xla_device())
+t1 = torch.randn(2، 2، device= xm.xla_device())
+print(t0 + t1)
+
+```
+
+
+أو ضرب المصفوفة:
+
+أو استخدامها مع وحدات الشبكة العصبية:
+
+```py
+l_in = torch.randn(10، device= xm.xla_device())
+linear = torch.nn.Linear(10، 20).to(xm.xla_device())
+l_out = linear(l_in)
+print(l_out)
+
+```
+
+
+مثل أنواع الأجهزة الأخرى، تعمل تنسورات XLA فقط مع تنسورات XLA الأخرى على نفس الجهاز. لذا فإن التعليمات البرمجية مثل
+
+```py
+l_in = torch.randn(10, device=xm.xla_device())
+linear = torch.nn.Linear(10, 20)
+l_out = linear(l_in)
+print(l_out)
+# Input tensor is not an XLA tensor: torch.FloatTensor
+
+```
+
+
+سيؤدي إلى حدوث خطأ لأن وحدة `torch.nn.Linear` موجودة على وحدة المعالجة المركزية.
+
+تشغيل النماذج على أجهزة XLA
+--------------------------------------------------------------------------------------------
+
+يتطلب بناء شبكة PyTorch جديدة أو تحويل شبكة موجودة للتشغيل على أجهزة XLA بضع سطور فقط من التعليمات البرمجية المحددة لـ XLA. تبرز المقتطفات التالية هذه الأسطر عند التشغيل على جهاز XLA واحد وعلى أجهزة XLA متعددة باستخدام المعالجة المتعددة لـ XLA.
+
+### التشغيل على جهاز XLA واحد
+
+توضح المقتطفات التالية شبكة تدريب على جهاز XLA واحد:
+
+```py
+import torch_xla.core.xla_model as xm
+
+device = xm.xla_device()
+model = MNIST().train().to(device)
+loss_fn = nn.NLLLoss()
+optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+
+for data, target in train_loader:
+  optimizer.zero_grad()
+  data = data.to(device)
+  target = target.to(device)
+  output = model(data)
+  loss = loss_fn(output, target)
+  loss.backward()
+
+  optimizer.step()
+  xm.mark_step()
+
+```
+
+
+يسلط هذا المقتطف الضوء على مدى سهولة التبديل بين نموذجك للتشغيل على XLA. يمكن أن يعمل تعريف النموذج وdataloader والمُحسن وحلقة التدريب على أي جهاز. التعليمات البرمجية الوحيدة المحددة لـ XLA هي بضع سطور تحصل على جهاز XLA وتعيين الخطوة. يؤدي استدعاء `xm.mark_step()` في نهاية كل تكرار تدريب إلى قيام XLA بتنفيذ مخططه الحالي وتحديث معلمات النموذج. راجع [التعمق في Tensor XLA](#xla-tensor-deep-dive) لمزيد من المعلومات حول كيفية إنشاء مخططات XLA وتشغيل العمليات.
+
+### التشغيل على أجهزة XLA متعددة باستخدام المعالجة المتعددة
+
+يجعل PyTorch/XLA من السهل تسريع التدريب عن طريق التشغيل على أجهزة XLA متعددة. يوضح المقتطف التالي كيفية القيام بذلك:
+
+```py
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+
+def _mp_fn(index):
+  device = xm.xla_device()
+  mp_device_loader = pl.MpDeviceLoader(train_loader, device)
+
+  model = MNIST().train().to(device)
+  loss_fn = nn.NLLLoss()
+  optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+
+  for data, target in mp_device_loader:
+    optimizer.zero_grad()
+    output = model(data)
+    loss = loss_fn(output, target)
+    loss.backward()
+    xm.optimizer_step(optimizer)
+
+if __name__ == '__main__':
+  xmp.spawn(_mp_fn, args=())
+
+```
+
+
+هناك ثلاثة اختلافات بين هذا المقتطف متعدد الأجهزة والمقتطف أحادي الجهاز السابق. دعنا نمر عليها واحدة تلو الأخرى.
+
+*   `xmp.spawn()`
+    
+    *   يقوم بإنشاء العمليات التي تشغل كل منها جهاز XLA.
+        
+    *   لن تتمكن كل عملية من الوصول إلى الجهاز المعين للعملية الحالية. على سبيل المثال، في TPU v4-8، سيتم تشغيل 4 عمليات وسيملك كل عملية جهاز TPU.
+        
+    *   لاحظ أنه إذا قمت بprint`xm.xla_device()` على كل عملية، فسترى `xla:0` على جميع الأجهزة. ويرجع ذلك إلى أنه يمكن لكل عملية رؤية جهاز واحد فقط. لا يعني هذا أن المعالجة المتعددة لا تعمل. التنفيذ الوحيد هو مع وقت تشغيل PJRT على TPU v2 وTPU v3 نظرًا لأنه سيكون هناك `#devices/2` عمليات وستحتوي كل عملية على خيوطين (تحقق من هذه [الوثيقة](https://github.com/pytorch/xla/blob/master/docs/pjrt.md#tpus-v2v3-vs-v4) لمزيد من التفاصيل).
+        
+*   `MpDeviceLoader`
+    
+    *   يحمل بيانات التدريب على كل جهاز.
+        
+    *   يمكن لـ `MpDeviceLoader` أن يلتف حول محمل بيانات PyTorch. يمكنه تحميل البيانات مسبقًا إلى الجهاز وتداخل تحميل البيانات مع تنفيذ الجهاز لتحسين الأداء.
+        
+    *   يستدعي `MpDeviceLoader` أيضًا `xm.mark_step` نيابة عنك لكل دفعة `batches_per_execution`(افتراضيًا 1) تم إرجاعها.
+        
+*   `xm.optimizer_step(optimizer)`
+    
+    *   يوحد الخلاصات بين الأجهزة ويصدر خطوة حساب الجهاز XLA.
+        
+    *   إنه إلى حد كبير `all_reduce_gradients` + `optimizer.step()` + `mark_step` ويعيد الخسارة المخفضة.
+        
+
+يظل تعريف النموذج وتعريف المحسن وحلقة التدريب كما هي.
+
+> **ملاحظة:** من المهم ملاحظة أنه عند استخدام المعالجة المتعددة، يمكن للمستخدم البدء في استرداد أجهزة XLA والوصول إليها فقط من داخل الدالة المستهدفة لـ `xmp.spawn()` (أو أي دالة يكون لـ `xmp.spawn()` أصل في مكدس الاستدعاء الخاص بها).
+
+راجع [مثال المعالجة المتعددة الكامل](https://github.com/pytorch/xla/blob/master/test/test_train_mp_mnist.py) لمزيد من المعلومات حول تدريب شبكة على أجهزة XLA متعددة باستخدام المعالجة المتعددة.
+
+### التشغيل على TPU Pods
+
+يمكن أن يكون الإعداد متعدد المضيفين لمختلف المعجلات مختلفًا جدًا. ستناقش هذه الوثيقة الأجزاء المستقلة عن الجهاز من التدريب متعدد المضيفين وستستخدم TPU + وقت تشغيل PJRT (المتوفرة حاليًا في الإصدارات 1.13 و2.x) كمثال.
+
+قبل البدء، يرجى الاطلاع على دليل المستخدم الخاص بنا [هنا](https://cloud.google.com/tpu/docs/run-calculation-pytorch) والذي سيوضح بعض أساسيات Google Cloud مثل كيفية استخدام أمر `gcloud` وكيفية إعداد مشروعك. يمكنك أيضًا التحقق من [هنا](https://cloud.google.com/tpu/docs/how-to) للحصول على جميع تعليمات Cloud TPU. ستركز هذه الوثيقة على منظور PyTorch/XLA للإعداد.
+
+لنفترض أن لديك المثال mnist أعلاه من قسم mnist أعلاه في `train_mnist_xla.py`. إذا كان تدريبًا أحادي المضيف متعدد الأجهزة، فستقوم بالاتصال بـ TPUVM وتشغيل الأمر مثل
+
+```bash
+PJRT_DEVICE=TPU python3 train_mnist_xla.py
+
+```
+
+
+الآن لتشغيل نفس النماذج على TPU v4-16 (التي تحتوي على مضيفين، كل منهما يحتوي على 4 أجهزة TPU)، ستحتاج إلى
+
+*   تأكد من إمكانية وصول كل مضيف إلى البرنامج النصي للتدريب وبيانات التدريب. يتم ذلك عادةً باستخدام أمر `gcloud scp` أو `gcloud ssh` لنسخ البرامج النصية للتدريب إلى جميع المضيفين.
+    
+*   قم بتشغيل نفس أمر التدريب على جميع المضيفين في نفس الوقت.
+    
+
+```bash
+gcloud alpha compute tpus tpu-vm ssh $USER-pjrt --zone=$ZONE --project=$PROJECT --worker=all --command="PJRT_DEVICE=TPU python3 train_mnist_xla.py"
+
+```
+
+
+سيقوم أمر `gcloud ssh` أعلاه بالاتصال عبر SSH بجميع المضيفين في Pod TPUVM وتشغيل نفس الأمر في نفس الوقت.
+
+> **ملاحظة:** تحتاج إلى تشغيل أمر gcloud أعلاه خارج VM TPUVM.
+
+رمز النموذج والتدريب هو نفسه للتدريب متعدد العمليات والتدريب متعدد المضيفين. ستضمن PyTorch/XLA والبنية الأساسية الأساسية أن يكون كل جهاز على دراية بالطوبولوجيا العالمية والمحلية والترتيبية المحلية والعالمية لكل جهاز. سيحدث الاتصال بين الأجهزة عبر جميع الأجهزة بدلاً من الأجهزة المحلية.
+
+لمزيد من التفاصيل حول وقت تشغيل PJRT وكيفية تشغيله على pod، يرجى الرجوع إلى هذه [الوثيقة](https://github.com/pytorch/xla/blob/master/docs/pjrt.md#tpu). للحصول على مزيد من المعلومات حول PyTorch/XLA وTPU pod ودليل كامل لتشغيل resnet50 مع fakedata على TPU pod، يرجى الرجوع إلى هذا [الدليل](https://cloud.google.com/tpu/docs/pytorch-pods).
+
+التعمق في Tensor XLA
+---------------------------------------------------------
+
+يتطلب استخدام تنسورات XLA وأجهزة XLA تغيير بضع سطور من التعليمات البرمجية فقط. ولكن على الرغم من أن تنسورات XLA تعمل بشكل مشابه لتنسورات CPU وCUDA، إلا أن دواخلها تختلف. يصف هذا القسم ما يجعل تنسورات XLA فريدة من نوعها.
+
+### تنسورات XLA كسولة
+
+تنفذ تنسورات CPU وCUDA العمليات على الفور أو **بهمة**. من ناحية أخرى، فإن تنسورات XLA **كسولة**. إنهم يسجلون العمليات في مخطط حتى تكون النتائج مطلوبة. يسمح تأجيل التنفيذ مثل هذا لـ XLA بتحسينه. على سبيل المثال، قد يتم دمج مخطط لعمليات منفصلة متعددة في عملية واحدة محسنة.
+
+التنفيذ الكسول غير مرئي بشكل عام للمستدعي. يقوم PyTorch/XLA تلقائيًا ببناء المخططات، وإرسالها إلى أجهزة XLA، ومزامنتها عند نسخ البيانات بين جهاز XLA ووحدة المعالجة المركزية. يؤدي إدراج حاجز عند اتخاذ خطوة محسن إلى مزامنة وحدة المعالجة المركزية وجهاز XLA بشكل صريح. لمزيد من المعلومات حول تصميم tensor الكسول لدينا، يمكنك قراءة [هذه الورقة](https://arxiv.org/pdf/2102.13267.pdf).
+
+### تنسورات XLA وbFloat16
+
+يمكن لـ PyTorch/XLA استخدام نوع بيانات [bfloat16](https://en.wikipedia.org/wiki/Bfloat16_floating-point_format) عند التشغيل على وحدات TPU. في الواقع، يتعامل PyTorch/XLA مع أنواع float (`torch.float` و`torch.double`) بشكل مختلف على وحدات TPU. يتحكم متغيرا البيئة `XLA_USE_BF16` و`XLA_DOWNCAST_BF16` في هذا السلوك:
+
+*   بشكل افتراضي، يكون كل من `torch.float` و`torch.double` عبارة عن `torch.float` على وحدات TPU.
+    
+*   إذا تم تعيين `XLA_USE_BF16`، يكون كل من `torch.float` و`torch.double` عبارة عن `bfloat16` على وحدات TPU.
+    
+*   إذا تم تعيين `XLA_DOWNCAST_BF16`، يكون `torch.float` عبارة عن `bfloat16` على وحدات TPU و`torch.double` عبارة عن `float32` على وحدات TPU.
+    
+*   إذا كان لدى PyTorch tensor نوع بيانات `torch.bfloat16`، فسيتم تعيينه مباشرةً إلى TPU `bfloat16` (نوع XLA الأساسي `BF16`).
+    
+
+يجب على المطورين ملاحظة أن _تنسورات XLA على وحدات TPU ستبلغ دائمًا عن نوع بيانات PyTorch_ الخاص بها بغض النظر عن نوع البيانات الفعلي الذي تستخدمه. هذا التحويل تلقائي وغير شفاف. إذا تم نقل Tensor XLA على وحدة TPU مرة أخرى إلى وحدة المعالجة المركزية، فسيتم تحويله من نوع البيانات الفعلي إلى نوع بيانات PyTorch. اعتمادًا على كيفية عمل الكود الخاص بك، يمكن أن يكون هذا التحويل الذي تم تحفيزه بنوع وحدة المعالجة مهمًا.
+
+### تlinearط الذاكرة
+
+تمثيل البيانات الداخلي لتنسورات XLA غير مرئي للمستخدم. لا تعرض تlinearط التخزين الخاص بها وهي تبدو دائمًا متجاورة، على عكس تنسورات CPU وCUDA. يسمح هذا لـ XLA بتعديل تlinearط ذاكرة tensor لتحقيق أداء أفضل.
+
+### نقل تنسورات XLA من وإلى وحدة المعالجة المركزية
+
+يمكن نقل تنسورات XLA من وحدة المعالجة المركزية إلى جهاز XLA ومن جهاز XLA إلى وحدة المعالجة المركزية. إذا تم نقل طريقة عرض، فسيتم أيضًا نسخ البيانات التي تعرضها إلى الجهاز الآخر ولا يتم الحفاظ على علاقة العرض. بعبارة أخرى، بمجرد نسخ البيانات إلى جهاز آخر، فليس لها علاقة بالجهاز السابق أو بأي تنسورات عليه. مرة أخرى، اعتمادًا على كيفية عمل الكود الخاص بك، يمكن أن يكون تقدير وتكييف هذا الانتقال مهمًا.
+
+### حفظ وتحميل تنسورات XLA
+يجب نقل تنسورات XLA إلى وحدة المعالجة المركزية قبل حفظها، كما هو موضح في المقتطف التالي:
+
+```py
+import torch
+import torch_xla
+import torch_xla.core.xla_model as xm
+
+device = xm.xla_device()
+
+t0 = torch.randn(2, 2, device=device)
+t1 = torch.randn(2, 2, device=device)
+
+tensors = (t0.cpu(), t1.cpu())
+
+torch.save(tensors, 'tensors.pt')
+
+tensors = torch.load('tensors.pt')
+
+t0 = tensors[0].to(device)
+t1 = tensors[1].to(device)
+```
+
+يسمح لك ذلك بوضع التنسورات المحملة على أي جهاز متاح، وليس فقط الجهاز الذي تم تهيئته عليه.
+
+وفقًا للملاحظة المذكورة أعلاه حول نقل تنسورات XLA إلى وحدة المعالجة المركزية، يجب توخي الحذر عند العمل مع العروض. بدلاً من حفظ العروض، يوصى بإعادة إنشائها بعد تحميل التنسورات ونقلها إلى أجهزتها الوجهة.
+
+تتوفر واجهة برمجة تطبيقات (API) مساعدة لحفظ البيانات من خلال التعامل مع نقلها مسبقًا إلى وحدة المعالجة المركزية:
+
+```py
+import torch
+import torch_xla
+import torch_xla.core.xla_model as xm
+
+xm.save(model.state_dict(), path)
+```
+
+في حالة وجود أجهزة متعددة، لن تقوم واجهة برمجة التطبيقات (API) أعلاه إلا بحفظ البيانات لترتيب الجهاز الرئيسي (0).
+
+في حالة كانت الذاكرة محدودة مقارنةً بحجم معلمات النموذج، تتوفر واجهة برمجة تطبيقات (API) تقلل من البصمة على المضيف:
+
+```py
+import torch_xla.utils.serialization as xser
+
+xser.save(model.state_dict(), path)
+```
+
+تقوم واجهة برمجة التطبيقات هذه (API) بتشغيل تنسورات XLA إلى وحدة المعالجة المركزية واحدة تلو الأخرى، مما يقلل من مقدار الذاكرة المضيفة المستخدمة، ولكنها تتطلب مطابقة واجهة برمجة تطبيقات التحميل لاستعادتها:
+
+```py
+import torch_xla.utils.serialization as xser
+
+state_dict = xser.load(path)
+model.load_state_dict(state_dict)
+```
+
+يمكن حفظ تنسورات XLA مباشرة ولكن لا يوصى بذلك. يتم دائمًا تحميل تنسورات XLA مرة أخرى إلى الجهاز الذي تم حفظها منه، وإذا كان هذا الجهاز غير متوفر، فسوف يفشل التحميل. PyTorch/XLA، مثل PyTorch بالكامل، قيد التطوير النشط وقد يتغير هذا السلوك في المستقبل.
+
+### التخزين المؤقت للتجميع
+
+يحول مجمع XLA تعليمة HLO المتبعة إلى برنامج تنفيذي يعمل على الأجهزة. يمكن أن تكون عملية التجميع مكلفة من حيث الوقت، وفي الحالات التي لا تتغير فيها HLO عبر عمليات التنفيذ، يمكن الاحتفاظ بنتيجة التجميع على القرص لإعادة استخدامها، مما يقلل بشكل كبير من وقت تكرار التطوير.
+
+يرجى ملاحظة أنه إذا تغيرت HLO بين عمليات التنفيذ، فسيظل يحدث إعادة التجميع.
+
+هذه حاليًا واجهة برمجة تطبيقات (API) تجريبية اختيارية، يجب تنشيطها قبل تنفيذ أي حسابات. يتم التهيئة من خلال واجهة برمجة تطبيقات initialize_cache:
+
+```py
+import torch_xla.runtime as xr
+xr.initialize_cache('YOUR_CACHE_PATH', readonly=False)
+```
+
+سيؤدي هذا إلى تهيئة ذاكرة التخزين المؤقت للتجميع المستمر في المسار المحدد. يمكن استخدام معلمة readonly للتحكم فيما إذا كان العامل قادرًا على الكتابة في الذاكرة المؤقتة، والتي يمكن أن تكون مفيدة عند استخدام تركيبة ذاكرة مشتركة لحمل عمل SPMD.
+
+### قراءات أخرى
+
+تتوفر وثائق إضافية في مستودع PyTorch/XLA [https://github.com/pytorch/xla/](https://github.com/pytorch/xla/). تتوفر أمثلة إضافية على تشغيل الشبكات على وحدات معالجة الرسوميات القابلة للبرمجة في [https://github.com/pytorch-tpu/examples](https://github.com/pytorch-tpu/examples).
+
+### واجهة برمجة تطبيقات PyTorch/XLA
+
+xla_model
+---------------------------------------------------------------------------
+
+torch_xla.core.xla_model.xla_device(_n\=None_, _devkind\=None_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#xla_device)
+
+يعيد مثيلًا معينًا لجهاز XLA.
+
+المعلمات
+
+*   **n** (_python:int__,_ _optional_) – المثيل المحدد (الترتيب) الذي سيتم إعادته. إذا تم تحديده، فسيتم إعادة مثيل جهاز XLA المحدد. وإلا فسيتم إعادة أول جهاز من نوع devkind.
+    
+*   **devkind** (_string__...__,_ _optional_) – إذا تم تحديده، نوع الجهاز مثل TPU أو CUDA أو CPU، أو اسم جهاز PJRT مخصص. تم الاستغناء عنه.
+    
+
+الإرجاعات
+
+جهاز torch.device بالمثيل المطلوب.
+
+torch_xla.core.xla_model.get_xla_supported_devices(_devkind\=None_, _max_devices\=None_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#get_xla_supported_devices)
+
+تعيد قائمة بالأجهزة المدعومة من نوع معين.
+
+المعلمات
+
+*   **devkind** (_string__...__,_ _optional_) – إذا تم تحديده، نوع الجهاز مثل TPU أو CUDA أو CPU، أو اسم جهاز PJRT مخصص.
+    
+*   **max_devices** (_python:int__,_ _optional_) – الحد الأقصى لعدد الأجهزة التي سيتم إرجاعها من هذا النوع.
+    
+
+الإرجاعات
+
+قائمة سلاسل الأجهزة مثل \['xla:0’، 'xla:1’، …\]
+
+نوع الإرجاع
+
+قائمة بسلاسل الأجهزة مثل \['xla
+
+torch_xla.core.xla_model.xla_device_hw(_device_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#xla_device_hw)
+
+تعيد نوع الأجهزة المادية للجهاز المحدد.
+
+المعلمات
+
+**device** (_string_ _or_ _torch.device_) – جهاز XLA الذي سيتم تعيينه إلى الجهاز الفعلي.
+
+الإرجاعات
+
+تمثيل سلسلة لنوع الأجهزة المادية للجهاز المحدد.
+
+torch_xla.core.xla_model.get_ordinal(_defval\=0_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#get_ordinal)
+
+تسترد الترتيب التكراري للخيط الحالي.
+
+تتراوح الترتيبات من 0 إلى xrt_world_size() ناقص 1.
+
+المعلمات
+
+**defval** (_python:int__,_ _optional_) – القيمة الافتراضية التي سيتم إرجاعها في حالة عدم توفر معلومات التكرار. يتم تجاهله للوقت الفعلي. الافتراضي: 0
+
+الإرجاعات
+
+الترتيب التكراري للخيط الحالي.
+
+torch_xla.core.xla_model.get_local_ordinal(_defval\=0_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#get_local_ordinal)
+
+تسترد الترتيب المحلي التكراري للخيط الحالي.
+
+تتراوح الترتيبات المحلية من 0 إلى عدد الأجهزة المحلية ناقص 1.
+
+المعلمات
+
+**defval** (_python:int__,_ _optional_) – القيمة الافتراضية التي سيتم إرجاعها في حالة عدم توفر معلومات التكرار. يتم تجاهله للوقت الفعلي. الافتراضي: 0
+
+الإرجاعات
+
+الترتيب التكراري المحلي للخيط الحالي.
+
+torch_xla.core.xla_model.is_master_ordinal(_local\=True_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#is_master_ordinal)
+
+التحقق مما إذا كانت العملية الحالية هي الترتيب الرئيسي (0).
+
+المعلمات
+
+**local** (_bool_) – ما إذا كان سيتم التحقق من الترتيب الرئيسي المحلي أو العالمي. في حالة التكرار متعدد المضيفات، هناك ترتيب رئيسي عالمي واحد فقط (المضيف 0، الجهاز 0)، بينما يوجد عدد المضيفات NUM_HOSTS الترتيبات الرئيسية المحلية. الافتراضي: True
+
+الإرجاعات
+
+قيمة منطقية تشير إلى ما إذا كانت العملية الحالية هي الترتيب الرئيسي.
+
+torch_xla.core.xla_model.xrt_world_size(_defval\=1_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#xrt_world_size)
+
+تسترد عدد الأجهزة التي تشارك في التكرار.
+
+المعلمات
+
+**defval** (_python:int__,_ _optional_) – القيمة الافتراضية التي سيتم إرجاعها في حالة عدم توفر معلومات التكرار. الافتراضي: 1
+
+الإرجاعات
+
+عدد الأجهزة التي تشارك في التكرار.
+
+torch_xla.core.xla_model.all_reduce(_reduce_type_, _inputs_, _scale\=1.0_, _groups\=None_, _pin_layout\=True_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#all_reduce)
+
+تنفيذ عملية تقليل داخل الموقع على تنسور الإدخال (التنسورات).
+
+المعلمات
+
+*   **reduce_type** (_string_) – واحد من `xm.REDUCE_SUM`، `xm.REDUCE_MUL`، `xm.REDUCE_AND`، `xm.REDUCE_OR`، `xm.REDUCE_MIN`، و `xm.REDUCE_MAX`.
+    
+*   **inputs** – إما تنسور torch.Tensor واحد أو قائمة من torch.Tensor لتنفيذ عملية تقليل جميع العمليات إليها.
+    
+*   **scale** (_python:float_) – قيمة قياسية للتقييم يتم تطبيقها بعد التخفيض. الافتراضي: 1.0
+    
+*   **groups** (_list__,_ _optional_) –
+    
+    قائمة من القوائم، تمثل مجموعات النسخ المتماثلة لعملية all_reduce(). مثال: \[\[0، 1، 2، 3\]، \[4، 5، 6، 7\]\]
+    
+    > يحدد مجموعتين، واحدة مع \[0، 1، 2، 3\] النسخ المتماثلة وواحدة مع \[4، 5، 6، 7\] النسخ المتماثلة. إذا لم يكن هناك سوى مجموعة واحدة مع جميع النسخ المتماثلة فيها.
+    
+*   **pin_layout** (_bool__,_ _optional_) – ما إذا كان سيتم تثبيت التlinearط لهذه العملية الاتصالية. يمكن لتثبيت التlinearط منع تلف البيانات المحتمل عندما يكون لدى كل عملية تشارك في الاتصال برنامج مختلف قليلاً، ولكنه قد يتسبب في فشل بعض عمليات التجميع XLA. قم بإلغاء تثبيت التlinearط عند ظهور رسالة خطأ مثل “HloModule لديه مزيج من التlinearط المقيد”.
+    
+
+الإرجاعات
+
+إذا تم تمرير تنسور torch.Tensor واحد، تكون قيمة الإرجاع هي تنسور torch.Tensor التي تحتوي على القيمة المخفضة (عبر النسخ المتماثلة). إذا تم تمرير قائمة/مجموعة، فستقوم هذه الوظيفة بتنفيذ عملية تقليل جميع العمليات داخل الموقع على تنسورات الإدخال، وإعادة القائمة/المجموعة نفسها.
+
+torch_xla.core.xla_model.all_gather(_value_, _dim\=0_, _groups\=None_, _output\=None_, _pin_layout\=True_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#all_gather)
+
+تنفيذ عملية الجمع الشامل على طول البعد المحدد.
+
+المعلمات
+
+*   **value** (_torch.Tensor_) – تنسور الإدخال.
+    
+*   **dim** (_python:int_) – بعد الجمع. الافتراضي: 0
+    
+*   **groups** (_list__,_ _optional_) –
+    
+    قائمة من القوائم، تمثل مجموعات النسخ المتماثلة لعملية all_gather(). مثال: \[\[0، 1، 2، 3\]، \[4، 5، 6، 7\]\]
+    
+    > يحدد مجموعتين، واحدة مع \[0، 1، 2، 3\] النسخ المتماثلة وواحدة مع \[4، 5، 6، 7\] النسخ المتماثلة. إذا لم يكن هناك سوى مجموعة واحدة مع جميع النسخ المتماثلة فيها.
+    
+*   **output** (_torch.Tensor_) – تنسور الإخراج الاختياري.
+    
+*   **pin_layout** (_bool__,_ _optional_) – ما إذا كان سيتم تثبيت التlinearط لهذه العملية الاتصالية. يمكن لتثبيت التlinearط منع تلف البيانات المحتمل عندما يكون لدى كل عملية تشارك في الاتصال برنامج مختلف قليلاً، ولكنه قد يتسبب في فشل بعض عمليات التجميع XLA. قم بإلغاء تثبيت التlinearط عند ظهور رسالة خطأ مثل “HloModule لديه مزيج من التlinearط المقيد”.
+    
+
+الإرجاعات
+
+تنسور الذي يحتوي، في بعد `dim`، على جميع القيم من النسخ المتماثلة المشاركة.
+
+torch_xla.core.xla_model.all_to_all(_value_, _split_dimension_, _concat_dimension_, _split_count_, _groups\=None_, _pin_layout\=True_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#all_to_all)
+
+تنفيذ عملية XLA AllToAll() على تنسور الإدخال.
+
+راجع: [https://www.tensorflow.org/xla/operation_semantics#alltoall](https://www.tensorflow.org/xla/operation_semantics#alltoall)
+
+المعلمات
+
+*   **value** (_torch.Tensor_) – تنسور الإدخال.
+    
+*   **split_dimension** (_python:int_) – البعد الذي سيتم إجراء الانقسام عليه.
+    
+*   **concat_dimension** (_python:int_) – البعد الذي سيتم إجراء عملية الدمج عليه.
+    
+*   **split_count** (_python:int_) – عدد الانقسامات.
+    
+*   **groups** (_list__,_ _optional_) –
+    
+    قائمة من القوائم، تمثل مجموعات النسخ المتماثلة لعملية all_reduce(). مثال: \[\[0، 1، 2، 3\]، \[4، 5، 6، 7\]\]
+    
+    > يحدد مجموعتين، واحدة مع \[0، 1، 2، 3\] النسخ المتماثلة وواحدة مع \[4، 5، 6، 7\] النسخ المتماثلة. إذا لم يكن هناك سوى مجموعة واحدة مع جميع النسخ المتماثلة فيها.
+    
+*   **pin_layout** (_bool__,_ _optional_) – ما إذا كان سيتم تثبيت التlinearط لهذه العملية الاتصالية. يمكن لتثبيت التlinearط منع تلف البيانات المحتمل عندما يكون لدى كل عملية تشارك في الاتصال برنامج مختلف قليلاً، ولكنه قد يتسبب في فشل بعض عمليات التجميع XLA. قم بإلغاء تثبيت التlinearط عند ظهور رسالة خطأ مثل “HloModule لديه مزيج من التlinearط المقيد”.
+    
+
+الإرجاعات
+
+نتيجة تنسور all_to_all().
+
+torch_xla.core.xla_model.add_step_closure(_closure_, _args\=()_, _run_async\=False_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/core/xla_model.html#add_step_closure)
+
+إضافة إغلاق إلى قائمة تلك التي سيتم تشغيلها في نهاية الخطوة.هل هذا جيد أم أنك تريدني أن أستمر في ترجمة بقية النص؟
+
+
+موزع
+-----------------------------------------------------------------------------------------
+
+_class_ torch\_xla.distributed.parallel\_loader.ParallelLoader(_loader_, _devices_, _batchdim\=0_, _batches\_per\_execution\=1_, _loader\_prefetch\_size\=8_, _device\_prefetch\_size\=4_, _host\_to\_device\_transfer\_threads\=1_, _input\_sharding\=None_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/parallel_loader.html#ParallelLoader)
+
+يغلف PyTorch DataLoader موجودًا بتحميل البيانات في الخلفية.
+
+المعلمات
+
+*   **loader** (`torch.utils.data.DataLoader`) – PyTorch DataLoader الذي سيتم تغليفه.
+    
+*   **devices** (torch.device…) – قائمة الأجهزة التي يجب إرسال البيانات إليها. سيتم إرسال العينة i التي يعيدها المحمل إلى devices\[i % len(devices)\].
+    
+*   **batchdim** (_python:int__,_ _optional_) – البعد الذي يحمل حجم الدفعة. الافتراضي: 0
+    
+*   **loader\_prefetch\_size** (_python:int__,_ _optional_) – السعة القصوى للصف المستخدم من قبل الخيط الذي يقرأ العينات من المحمل، ليتم معالجتها بواسطة خيوط العامل التي تقوم بتحميل البيانات إلى الأجهزة. الافتراضي: 8
+    
+*   **device\_prefetch\_size** (_python:int__,_ _optional_) – الحجم الأقصى لصفوف لكل جهاز، حيث تقوم خيوط العامل بإيداع التنسورات التي تم إرسالها بالفعل إلى الأجهزة. الافتراضي: 4
+    
+*   **host\_to\_device\_transfer\_threads** (_python:int__,_ _optional_) – عدد الخيوط التي تعمل بالتوازي لنقل البيانات من صف المحمل إلى صف الجهاز. الافتراضي: 1
+    
+*   **input\_sharding** (_ShardingSpec__,_ _optional_) – مواصفات التجزئة لتطبيقها على تنسورات الإدخال المتوافقة بعد التحميل. الافتراضي: None
+    
+
+per\_device\_loader(_device_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/parallel_loader.html#ParallelLoader.per_device_loader)
+
+استرداد كائن مؤشر المحمل للجهاز المحدد.
+
+المعلمات
+
+**device** (torch.device) – الجهاز الذي يتم طلب المحمل الخاص به.
+
+الإرجاعات
+
+كائن مؤشر المحمل للجهاز. هذا ليس واجهة torch.utils.data.DataLoader، ولكن مؤشر Python الذي يعيد نفس بنية البيانات التنسور كما هو معيد بواسطة torch.utils.data.DataLoader الملفوف، ولكن يقيم على أجهزة XLA.
+
+torch\_xla.distributed.xla\_multiprocessing.spawn(_fn_, _args\=()_, _nprocs\=None_, _join\=True_, _daemon\=False_, _start\_method\='spawn'_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/xla_multiprocessing.html#spawn)
+
+تمكين التكرار متعدد المعالجة القائم على التكرار.
+
+المعلمات
+
+*   **fn** (_callable_) – الدالة التي سيتم استدعاؤها لكل جهاز يشارك في التكرار. ستتم استدعاء الدالة مع أول وسيط وهو الفهرس العالمي للعملية ضمن التكرار، متبوعًا بالوسائط التي تم تمريرها في args.
+    
+*   **args** (_tuple_) – وسائط fn. الافتراضي: مجموعة فارغة
+    
+*   **nprocs** (_python:int_) – عدد العمليات/الأجهزة للتكرار. في الوقت الحالي، إذا تم تحديده، يمكن أن يكون إما 1 أو العدد الأقصى من الأجهزة.
+    
+*   **join** (_bool_) – ما إذا كان يجب أن يكون الاستدعاء حظرًا في انتظار اكتمال العمليات التي تم إنشاؤها. الافتراضي: True
+    
+*   **daemon** (_bool_) – ما إذا كان يجب تعيين علامة daemon للعمليات التي تم إنشاؤها (راجع واجهة برمجة تطبيقات Python متعددة المعالجة). الافتراضي: False
+    
+*   **start\_method** (_string_) – طريقة إنشاء العملية متعددة المعالجة في Python. الافتراضي: spawn
+    
+
+الإرجاعات
+
+نفس الكائن الذي تمت إعادته بواسطة واجهة برمجة التطبيقات (API) torch.multiprocessing.spawn. إذا كان nprocs يساوي 1، فسيتم استدعاء الدالة fn مباشرةً، وستعيد واجهة برمجة التطبيقات (API) القيمة None.
+
+_class_ torch\_xla.distributed.xla\_multiprocessing.MpModelWrapper(_model_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/xla_multiprocessing.html#MpModelWrapper)
+
+تغليف نموذج لتقليل استخدام ذاكرة المضيف عند استخدام طريقة fork.
+
+يجب استخدام هذه الفئة مع واجهة برمجة تطبيقات spawn(…, start_method='fork') لتقليل استخدام ذاكرة المضيف. بدلاً من إنشاء نماذج على كل عملية متعددة المعالجة، وبالتالي تكرار ذاكرة المضيف الأولية للنموذج، يتم إنشاء النموذج مرة واحدة في النطاق العالمي، ثم نقله إلى كل جهاز داخل الدالة المستهدفة بواسطة spawn(). المثال:
+
+```py
+WRAPPED_MODEL = xmp.MpModelWrapper(MyNetwork())
+
+def _mp_fn(index, ...):
+  device = xm.xla_device()
+  model = WRAPPED_MODEL.to(device)
+  ...
+
+xmp.spawn(_mp_fn, ..., start_method='fork')
+
+```
+
+
+لهذه الطريقة ميزتان. أولاً، يستخدم نسخة واحدة فقط من صفحات الذاكرة لاستضافة أوزان النموذج الأولية، وثانيًا، فهو يقوم بتبسيط نقل النموذج الملفوف إلى كل جهاز، عن طريق تقليل التحميل على ذاكرة النظام أثناء العملية.
+
+to(_device_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/xla_multiprocessing.html#MpModelWrapper.to)
+
+استرداد النموذج المنقول إلى الجهاز المحدد.
+
+المعلمات
+
+**device** (_torch.device_) – الجهاز الذي يجب نقل النموذج عليه.
+
+الإرجاعات
+
+النموذج على الجهاز المحدد.
+
+_class_ torch\_xla.distributed.xla\_multiprocessing.MpSerialExecutor[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/xla_multiprocessing.html#MpSerialExecutor)
+
+مرفق لتشغيل دالة بطريقة متسلسلة بين عمليات متعددة النواة.
+
+مثال:
+
+```py
+# At global scope.
+SERIAL_EXEC = xmp.MpSerialExecutor()
+
+def load_dataset(path):
+  return maybe_download_and_load(path)
+
+def _mp_fn(index, ...):
+  # Avoid all cores downloading the same data with the serial executor.
+  dataset = SERIAL_EXEC.run(lambda: load_dataset('/tmp/mnist-data'))
+  ...
+
+xmp.spawn(_mp_fn, ...)
+
+```
+
+
+run(_fn_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/distributed/xla_multiprocessing.html#MpSerialExecutor.run)
+
+تشغيل الدالة المقدمة بطريقة متسلسلة WRT لكل عملية لكل نواة.
+
+المعلمات
+
+**fn** (_callable_) – الدالة التي سيتم تشغيلها بطريقة متسلسلة.
+
+الإرجاعات
+
+قيمة الإرجاع fn.
+
+الأدوات المساعدة
+-------------------------------------------------------------------
+
+_class_ torch\_xla.utils.utils.SampleGenerator(_data_, _sample\_count_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/utils/utils.html#SampleGenerator)
+
+مؤشر يعيد عدة عينات من بيانات الإدخال المحددة.
+
+يمكن استخدامه بدلاً من PyTorch DataLoader لتوليد بيانات اصطناعية.
+
+المعلمات
+
+*   **data** – البيانات التي يجب إعادتها في كل خطوة من المؤشر.
+    
+*   **sample\_count** – العدد الأقصى لعينات البيانات التي سيتم إرجاعها.
+    
+
+_class_ torch\_xla.utils.utils.DataWrapper[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/utils/utils.html#DataWrapper)
+
+فئة مساعدة لتغليف بنى البيانات التي سيتم إرسالها إلى الجهاز.
+
+torch\_xla.utils.serialization.save(_data_, _path_, _master\_only\=True_, _global\_master\=False_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/utils/serialization.html#save)
+
+حفظ بيانات الإدخال في ملف.
+
+تتم نقل البيانات المحفوظة إلى جهاز PyTorch CPU قبل حفظها، لذا فإن أي عملية تحميل لاحقة باستخدام torch.load() ستحمل بيانات CPU. يجب توخي الحذر عند العمل مع العروض. بدلاً من حفظ العروض، يوصى بإعادة إنشائها بعد تحميل التنسورات ونقلها إلى أجهزتها الوجهة.
+
+المعلمات
+
+*   **data** – بيانات الإدخال التي سيتم حفظها. أي مجموعة متداخلة من كائنات Python (القائمة، المجموعات، المجموعات، القواميس، …).
+    
+*   **path** – ملف الوجهة لعملية حفظ البيانات. إذا كان master_only هو `False` يجب أن يشير المسار إلى وجهات مختلفة، وإلا فإن جميع عمليات الكتابة من نفس المضيف ستكتب فوق بعضها البعض.
+    
+*   **master\_only** (_bool__,_ _optional_) – ما إذا كان يجب على الجهاز الرئيسي فقط حفظ البيانات. إذا كانت القيمة False، فيجب أن تشير وسيطة المسار إلى مسار مختلف لكل من الترتيبات التي تشارك في التكرار، وإلا فستقوم جميع النسخ المتماثلة على نفس المضيف بالكتابة في نفس الموقع. الافتراضي: True
+    
+*   **global\_master** (_bool__,_ _optional_) – عندما تكون `master_only` هي `True` تتحكم هذه العلامة فيما إذا كان كل مضيف رئيسي (إذا كانت `global_master` هي `False`) يحفظ المحتوى، أو فقط المضيف الرئيسي العالمي (الترتيب 0). الافتراضي: False
+    
+
+torch\_xla.utils.serialization.load(_path_)[\[source\]](https://pytorch.org/xla/release/2.3/_modules/torch_xla/utils/serialization.html#load)
+
+تحميل البيانات التي تم حفظها سابقًا باستخدام واجهة برمجة تطبيقات save().
+
+المعلمات
+
+**path** (_str_) – المسار الذي تم تمريره إلى واجهة برمجة التطبيقات save().
+
+الإرجاعات
+
+البيانات المحملة.
+
+اختبار
+------------------------------------------
+
+دليل المبتدئين إلى PyTorch/XLA
+------------------------------------------------------------------------------------------------
+
+توفر هذه الوثيقة نظرة عامة رفيعة المستوى حول PyTorch XLA وتوضح بعض الأمثلة حول كيفية تحويل رمز PyTorch لتشغيله على أجهزة XLA (مثل وحدات معالجة الرسوميات القابلة للبرمجة). هذه ليست حلاً كاملاً، وقد تكون هناك حاجة إلى تغييرات إضافية اعتمادًا على التعليمات البرمجية المحددة. ومع ذلك، يجب أن تكون هذه الوثيقة بمثابة نقطة انطلاق لعملية التحويل.
+
+فهم أساسي عالي المستوى لبعض تفاصيل XLA
+--------------------------------------------------------------------------------------------------------------------------------------
+
+يقدم هذا القسم نظرة عامة موجزة على التفاصيل الأساسية لـ PyTorch XLA،
+
+والذي يجب أن يساعد القراء على فهم أفضل للتعديلات والتحسينات المطلوبة للرمز. إنه مكمل لدليل واجهة برمجة التطبيقات الموصوفة [هنا](https://github.com/pytorch/xla/blob/master/API_GUIDE.md).
+
+على عكس PyTorch العادي، الذي ينفذ التعليمات البرمجية سطرًا تلو الآخر ولا يمنع التنفيذ حتى يتم استرداد قيمة تنسور PyTorch، يعمل PyTorch XLA بشكل مختلف. فهو يمر عبر التعليمات البرمجية لـ Python ويسجل العمليات على تنسورات (PyTorch) XLA في رسم بياني لتمثيل وسيط (IR) حتى يواجه حاجزًا (تمت مناقشته أدناه). يُشار إلى عملية إنشاء رسم بياني IR باسم التتبع (تتبع LazyTensor أو تتبع التعليمات البرمجية). ثم يقوم PyTorch XLA بتحويل الرسم البياني IR إلى تنسيق منخفض المستوى يمكن قراءته بواسطة الآلة يسمى HLO (رموز العمليات عالية المستوى). HLO هو تمثيل لحساب محدد لمجمع XLA ويتيح له إنشاء كود فعال للأجهزة التي يعمل عليها. يتم تغذية HLO إلى مجمع XLA للتجمع والتحسين. يتم بعد ذلك تخزين تجميع الرسم البياني بواسطة PyTorch XLA لإعادة استخدامه لاحقًا إذا/عند الحاجة. يتم التجميع على المضيف (وحدة المعالجة المركزية)، وهو الجهاز الذي يشغل التعليمات البرمجية لـ Python. إذا كان هناك أجهزة XLA متعددة، يقوم المضيف بتجميع التعليمات البرمجية لكل من الأجهزة بشكل منفصل باستثناء عند استخدام SPMD (برنامج واحد، بيانات متعددة). على سبيل المثال، يحتوي v4-8 على آلة مضيف واحدة و [أربعة أجهزة](https://cloud.google.com/tpu/docs/system-architecture-tpu-vm#tpu_v4). في هذه الحالة، يقوم المضيف بتجميع التعليمات البرمجية لكل من الأجهزة الأربعة بشكل منفصل. في حالة شرائح pod، عندما يكون هناك مضيفون متعددون، يقوم كل مضيف بالتجميع لأجهزة XLA التي يتم توصيله بها. إذا تم استخدام SPMD، يتم تجميع التعليمات البرمجية مرة واحدة فقط (لأشكال وحسابات معينة) على كل مضيف لجميع الأجهزة.
+
+[![img](https://pytorch.org/xla/release/2.3/assets/pytorchXLA_flow.svg)](https://pytorch.org/xla/release/2.3/assets/pytorchXLA_flow.svg)
+
+لمزيد من التفاصيل والأمثلة، يرجى الرجوع إلى [دليل LazyTensor](https://pytorch.org/blog/understanding-lazytensor-system-performance-with-pytorch-xla-on-cloud-tpu/).
+
+يتم تنفيذ العمليات في رسم بياني IR فقط عندما تكون قيم التنسورات مطلوبة. يُشار إلى هذا باسم تقييم التنسورات أو ماديتهم. يُطلق على هذا أيضًا التقييم البطيء ويمكن أن يؤدي إلى تحسينات كبيرة في الأداء.
+
+تؤدي العمليات المتزامنة في Pytorch XLA، مثل الprintأو التسجيل أو نقاط التفتيش أو الاستدعاءات، إلى إبطاء التتبع والنتائج في التنفيذ البطيء. في حالة وجود عملية تتطلب قيمة تنسور XLA محددة، على سبيل المثال `print(xla_tensor_z)`، يتم حظر التتبع حتى تصبح قيمة هذا التنسور متاحة للمضيف. لاحظ أنه يتم تنفيذ جزء الرسم البياني المسؤول عن حساب قيمة التنسور فقط. لا تقطع هذه العمليات رسم بياني IR، ولكنها تؤدي إلى اتصال المضيف بالجهاز من خلال `TransferFromDevice`، مما يؤدي إلى بطء الأداء.
+
+الحاجز هو تعليمات خاصة تخبر XLA بتنفيذ رسم بياني IR وإظهار التنسورات. وهذا يعني أن تنسورات PyTorch XLA سيتم تقييمها، وستكون النتائج متاحة للمضيف. الحاجز المكشوف للمستخدم في Pytorch XLA هو [xm.mark_step()](https://github.com/pytorch/xla/blob/bdceee54eca1269ee954f6cdd1868c584d0e88a4/torch_xla/core/xla_model.py#L808)، والذي يكسر رسم بياني IR وينتج عنه تنفيذ التعليمات البرمجية على أجهزة XLA. إحدى الخصائص الرئيسية لـ `xm.mark_step` هي أنه على عكس العمليات المتزامنة، فإنه لا يحظر التتبع الإضافي أثناء تنفيذ الجهاز للرسم البياني. ومع ذلك، فإنه يحظر الوصول إلى قيم التنسورات التي يتم إظهارها.
+
+يوضح المثال في دليل LazyTensor ما يحدث في حالة إضافة بسيطة لتنسورين. الآن، افترض أن لدينا حلقة for تضيف تنسورات XLA وتستخدم القيمة لاحقًا:
+
+```py
+for x, y in tensors_on_device:
+    z += x + y
+
+```
+
+
+بدون حاجز، سيؤدي التتبع في Python إلى رسم بياني واحد يلتف حول إضافة التنسورات `len(tensors_on_device)` مرات. ويرجع ذلك إلى أن حلقة for لا يتم التقاطها بواسطة التتبع، لذا فإن كل تكرار للحلقة سينشئ رسمًا بيانيًا فرعيًا يقابل حساب `z += x+y` ويضيفه إلى الرسم البياني. فيما يلي مثال عندما `len(tensors_on_device)=3`.
+
+[![img](https://pytorch.org/xla/release/2.3/assets/IRgraph_no_markstep.png)](https://pytorch.org/xla/release/2.3/assets/IRgraph_no_markstep.png)
+
+ومع ذلك، فإن إضافة حاجز في نهاية الحلقة سينتج عنه رسم بياني أصغر سيتم تجميعه مرة واحدة أثناء المرور الأول داخل حلقة for وسيتم إعادة استخدامه للمرور التالي `len(tensors_on_device)-1`. سيؤدي الحاجز إلى إشارة إلى التتبع بأن الرسم البياني الذي تم تتبعه حتى الآن يمكن تقديمه للتنفيذ، وإذا تم رؤية الرسم البياني من قبل، فسيتم إعادة استخدام برنامج مجمع.
+
+```py
+for x, y in tensors_on_device:
+    z += x + y
+    xm.mark_step()
+
+```
+
+
+في هذه الحالة، سيكون هناك رسم بياني صغير يتم استخدامه `len(tensors_on_device)=3` مرات.
+
+[![img](https://pytorch.org/xla/release/2.3/assets/IRgraph_markstep.png)](https://pytorch.org/xla/release/2.3/assets/IRgraph_markstep.png)
+
+من المهم تسليط الضوء على أنه في PyTorch XLA يتم تتبع التعليمات البرمجية لـ Python داخل حلقات for ويتم إنشاء رسم بياني جديد لكل تكرار إذا كان هناك حاجز في النهاية. يمكن أن يكون هذا عنق زجاجة كبيرًا للأداء.
+
+يمكن إعادة استخدام الرسوم البيانية XLA عندما يحدث نفس الحساب على نفس أشكال التنسورات. إذا تغيرت أشكال تنسورات الإدخال أو التنسورات الوسيطة، فسيقوم مجمع XLA بإعادة تجميع رسم بياني جديد بأشكال تنسور جديدة. وهذا يعني أنه إذا كان لديك أشكال ديناميكية أو إذا لم يكن رمزك يعيد استخدام رسوم بيانية تنسور، فإن تشغيل نموذجك على XLA لن يكون مناسبًا لهذه الحالة الاستخدام. يمكن أن يكون حشو الإدخال في شكل ثابت خيارًا للمساعدة في تجنب الأشكال الديناميكية. وإلا، سيقضي المجمع وقتًا كبيرًا في تحسين ودمج العمليات التي لن يتم استخدامها مرة أخرى.
+
+من المهم أيضًا مراعاة المقايضة بين حجم الرسم البياني ووقت التجميع. إذا كان هناك رسم بياني IR واحد كبير، فقد يقضي مجمع XLA الكثير من الوقت في تحسين ودمج العمليات. قد يؤدي هذا إلى وقت تجميع طويل للغاية. ومع ذلك، قد يكون التنفيذ اللاحق أسرع، وذلك بسبب التحسينات التي تم إجراؤها أثناء التجميع.
+
+في بعض الأحيان، يجدر كسر الرسم البياني IR باستخدام `xm.mark_step()`. كما هو موضح أعلاه، سيؤدي هذا إلى رسم بياني أصغر يمكن إعادة استخدامه لاحقًا. ومع ذلك، فإن جعل الرسوم البيانية أصغر يمكن أن يقلل من التحسينات التي يمكن أن يقوم بها مجمع XLA.
+
+من المهم أيضًا مراعاة [MPDeviceLoader](https://github.com/pytorch/xla/blob/a1f822e2627a5639464273241821852677401026/torch_xla/distributed/parallel_loader.py#L186). بمجرد تشغيل التعليمات البرمجية على جهاز XLA، فكر في تغليف برنامج تحميل البيانات في PyTorch باستخدام XLA `MPDeviceLoader` الذي يقوم مسبقًا بتحميل البيانات إلى الجهاز لتحسين الأداء ويشمل `xm.mark_step()` فيه. يؤدي الأخير تلقائيًا إلى كسر التكرارات عبر دفعات البيانات وإرسالها للتنفيذ. لاحظ أنه إذا كنت لا تستخدم MPDeviceLoader، فقد تحتاج إلى تعيين `barrier=True` في `optimizer_step()` لتمكين `xm.mark_step()` إذا كنت تقوم بتشغيل مهمة تدريب أو إضافة `xm.mark_step()` بشكل صريح.
+
+إعداد TPU
+----------------------------------------------------
+
+قم بإنشاء TPU باستخدام الصورة الأساسية لاستخدام العجلات الليلية أو من الإصدار الثابت عن طريق تحديد `RUNTIME_VERSION`.
+
+```bash
+export ZONE=us-central2-b
+export PROJECT_ID=your-project-id
+export ACCELERATOR_TYPE=v4-8 # v4-16, v4-32, …
+export RUNTIME_VERSION=tpu-vm-v4-pt-2.0 # or tpu-vm-v4-base
+export TPU_NAME=your_tpu_name
+
+gcloud compute tpus tpu-vm create ${TPU_NAME} \
+--zone=${ZONE} \
+--accelerator-type=${ACCELERATOR_TYPE} \
+--version=${RUNTIME_VERSION} \
+--subnetwork=tpusubnet
+
+```
+
+
+إذا كان لديك آلة افتراضية واحدة للمضيف (مثل v4-8)، فيمكنك تسجيل الدخول إلى الآلة الظاهرية الخاصة بك وتشغيل الأوامر التالية من الآلة الظاهرية مباشرة. خلاف ذلك، في حالة شرائح TPU، يمكنك استخدام `--worker=all --command=""` مشابهة لما يلي
+
+```bash
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+--zone=us-central2-b \
+--worker=all \
+--command="pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-nightly-cp38-cp38-linux_x86_64.whl"
+
+```
+
+
+بعد ذلك، إذا كنت تستخدم الصورة الأساسية، فقم بتثبيت الحزم الليلية والمكتبات المطلوبة
+
+```bash
+pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-nightly-cp38-cp38-linux_x86_64.whl
+​​pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-nightly-cp38-cp38-linux_x86_64.whl
+sudo apt-get install libopenblas-dev -y
+
+sudo apt-get update && sudo apt-get install libgl1 -y # diffusion specific
+
+```
+
+
+تحويل التعليمات البرمجية إلى PyTorch XLA
+----------------------------------------------------------------------------------------------
+
+إرشادات عامة لتعديل التعليمات البرمجية الخاصة بك:
+
+*   استبدل `cuda` بـ `xm.xla_device()`
+    
+*   إزالة شريط التقدم، والprintالتي من شأنها الوصول إلى قيم تنسور XLA
+    
+*   تقليل التسجيل والاستدعاءات التي من شأنها الوصول إلى قيم تنسور XLA
+    
+*   قم بتغليف برنامج تحميل البيانات باستخدام MPDeviceLoader
+    
+*   قم بالتحليل لتحسين التعليمات البرمجية بشكل أكبر
+    
+
+تذكر: كل حالة فريدة من نوعها، لذلك قد تحتاج إلى القيام بشيء مختلف لكل حالة.
+
+المثال 1. استدلال Stable Diffusion في PyTorch Lightning على جهاز TPU واحد
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+كمثال أول، ضع في اعتبارك [رمز الاستدلال](https://github.com/pytorch-tpu/stable-diffusion/blob/main/scripts/txt2img.py) لنموذج stable diffusion في PyTorch Lightning الذي يمكن تشغيله من سطر الأوامر على النحو التالي
+
+```bash
+python scripts/txt2img.py --prompt "a photograph of an astronaut riding a horse"
+
+```
+
+
+للإشارة، يمكن العثور على الفرق في التعديلات الموضحة أدناه [هنا](https://github.com/pytorch-tpu/stable-diffusion/commit/57f398eb784387e244dc5fb78421aa5261abd1ef). دعنا نتناولها خطوة بخطوة. كما هو موضح في الإرشادات العامة أعلاه، ابدأ بالتغييرات المتعلقة بجهاز `cuda`. تم كتابة رمز الاستدلال هذا لتشغيله على وحدات معالجة الرسوميات، ويمكن العثور على `cuda` في أماكن متعددة. ابدأ بإجراء تغييرات عن طريق إزالة `model.cuda()` من [هذا السطر](https://github.com/pytorch-tpu/stable-diffusion/blob/978da4c625a712a01ee066d019a0b0d2319cd8b3/scripts/txt2img.py#L64)، و `precision_scope` من [هنا](https://github.com/pytorch-tpu/stable-diffusion/blob/978da4c625a712a01ee066d019a0b0d2319cd8b3/scripts/txt2img.py#L290). بالإضافة إلى ذلك، استبدل جهاز `cuda` في [هذا السطر](https://github.com/pytorch-tpu/stable-diffusion/blob/978da4c625a712a01ee066d019a0b0d2319cd8b3/scripts/txt2img.py#L248) بجهاز `xla` مشابه للكود أدناه:
+
+بعد ذلك، يستخدم هذا التكوين المحدد للنموذج `FrozenCLIPEmbedder`، لذلك سنعدل هذا [السطر](https://github.com/pytorch-tpu/stable-diffusion/blob/978da4c625a712a01ee066d019a0b0d2319cd8b3/ldm/modules/encoders/modules.py#L143) أيضًا. للبساطة، سنحدد الجهاز `device` في هذا البرنامج التعليمي، ولكن يمكنك تمرير قيمة `device` إلى الدالة أيضًا.
+
+```py
+import torch_xla.core.xla_model as xm
+self.device = xm.xla_device()
+
+```
+
+
+مكان آخر في التعليمات البرمجية يحتوي على تعليمات برمجية محددة لـ cuda هو جدول DDIM. أضف `import torch_xla.core.xla_model as xm` أعلى الملف ثم استبدل [هذه](https://github.com/pytorch-tpu/stable-diffusion/blob/978da4c625a712a01ee066d019a0b0d2319cd8b3/ldm/models/diffusion/ddim.py#L21-L22) الأسطر
+
+```py
+if attr.device != torch.device("cuda"):
+   attr = attr.to(torch.device("cuda"))
+
+```
+
+
+مع
+
+```py
+device = xm.xla_device()
+attr = attr.to(torch.device(device))
+
+```
+
+
+بعد ذلك، يمكنك تقليل اتصال الجهاز (TPU) والمضيف (وحدة المعالجة المركزية) عن طريق إزالة عبارات الprint وتعطيل أشرطة التقدم، وتقليل أو إزالة الاستدعاءات والتسجيل. تتطلب هذه العمليات من الجهاز التوقف عن التنفيذ، والعودة إلى وحدة المعالجة المركزية، وتنفيذ التسجيل/الاستدعاءات، ثم العودة إلى الجهاز. يمكن أن يكون هذا عنق زجاجة كبيرًا للأداء، خاصة في النماذج الكبيرة.
+
+بعد إجراء هذه التغييرات، سيعمل الكود على وحدات معالجة الرسوميات القابلة للبرمجة. ومع ذلك، سيكون الأداء بطيئًا للغاية. ويرجع ذلك إلى أن مجمع XLA يحاول بناء رسم بياني واحد (ضخم) يلتف حول عدد خطوات الاستدلال (في هذه الحالة، 50) نظرًا لعدم وجود حاجز داخل حلقة for. من الصعب على المجمع تحسين الرسم البياني، مما يؤدي إلى تدهور كبير في الأداء. كما نوقش أعلاه، فإن كسر حلقة for بحاجز (xm.mark_step()) سينتج عنه رسم بياني أصغر يمكن للمجمّع تحسينه بسهولة أكبر. سيسمح هذا أيضًا للمجمّع بإعادة استخدام الرسم البياني من الخطوة السابقة، مما قد يحسن الأداء.
+
+الآن، الكود [جاهز](https://github.com/pytorch-tpu/stable-diffusion/blob/ss-inference/scripts/txt2img.py) للتشغيل على وحدات معالجة الرسوميات القابلة للبرمجة في وقت معقول. يمكن إجراء المزيد من التحليل والتحسين عن طريق [التقاط ملف تعريف الارتباط](https://cloud.google.com/tpu/docs/pytorch-xla-performance-profiling-tpu-vm) ودراسته بشكل أكبر. ومع ذلك، لا يتم تغطية ذلك هنا.
+
+ملاحظة: إذا كنت تقوم بالتشغيل على جهاز TPU v4-8، فستتوفر لديك 4 أجهزة XLA (TPU) متاحة. لن يؤدي تشغيل الكود كما هو موضح أعلاه إلا إلى استخدام جهاز XLA واحد. لتشغيله على جميع الأجهزة الأربعة، تحتاج إلى استخدام دالة `xmp.spawn()` لتنفيذ الكود على جميع الأجهزة. سنناقش `xmp.spawn` في المثال التالي.
+
+المثال 2. استدلال HF Stable Diffusion
+-----------------------------------------------------------------------------------------------------------------
+
+الآن، ضع في اعتبارك استخدام [استدلال Stable Diffusion](https://github.com/huggingface/diffusers/tree/main/examples/text_to_image) في مكتبة HuggingFace diffusers لكل من إصدارات SD-XL و 2.1 من النموذج. للرجوع، يمكن العثور على التغييرات الموضحة أدناه في هذا [المستودع](https://github.com/pytorch-tpu/diffusers). يمكنك استنساخ المستودع وتشغيل الاستدلال باستخدام الأمر التالي على آلة TPU الظاهرية الخاصة بك:
+
+```bash
+(vm)$ git clone https://github.com/pytorch-tpu/diffusers.git
+(vm)$ cd diffusers/examples/text_to_image/
+(vm)$ python3 inference_tpu_single_device.py
+
+```
+
+
+نظرًا لعدم توفر إصدار bf16 لنموذج SD-XL، فيمكنك استخدام علامة `XLA_USE_BF16=1` لتحويل جميع القيم إلى bf16 وتسريع التدريب.
+
+```bash
+(vm)$ XLA_USE_BF16=1 python3 inference_tpu_single_device.py # uses sd-xl version
+
+```
+
+
+أو
+
+```bash
+(vm)$ python3 inference_tpu_multidevice.py # uses 2.1 version
+
+```
+
+
+(يشمل بالفعل `torch.bfloat16` في إصدار 2.1 من النموذج).
+
+تحذير: انتبه للتحذيرات الموضحة [هنا](https://github.com/huggingface/diffusers/pull/4254#issuecomment-1712289803).
+
+التشغيل على جهاز TPU واحد
+----------------------------------------------------------------------------------------------
+
+يصف هذا القسم التغييرات التي يجب إجراؤها على [رمز مثال الاستدلال text_to_image](https://github.com/huggingface/diffusers/tree/main/examples/text_to_image#inference) لتشغيله على وحدات معالجة الرسوميات القابلة للبرمجة.
+
+يستخدم الكود الأصلي Lora للاستدلال، ولكن لن يستخدم هذا البرنامج التعليمي ذلك. بدلاً من ذلك، سنحدد وسيط `model_id` إلى `stabilityai/stable-diffusion-xl-base-0.9` عند تهيئة الأنابيب. سنستخدم أيضًا جدول المواعيد الافتراضي (DPMSolverMultistepScheduler). ومع ذلك، يمكن إجراء تغييرات مماثلة على الجداول الأخرى أيضًا.
+
+```bash
+git clone https://github.com/huggingface/diffusers
+cd diffusers
+pip install . # pip install -e .
+
+cd examples/text_to_image/
+pip install -r requirements.txt
+pip install invisible_watermark transformers accelerate safetensors
+
+```
+
+
+(إذا لم يتم العثور على `accelerate`، فقم بتسجيل الخروج، ثم سجل الدخول مرة أخرى.)
+
+قم بتسجيل الدخول إلى HF ووافق على [ترخيص sd-xl 0.9](https://huggingface.co/stabilityai/stable-diffusion-xl-base-0.9) على بطاقة النموذج. بعد ذلك، انتقل إلى [علامة حساب→الإعدادات→الوصول](https://huggingface.co/settings/tokens) وقم بتوليد رمز جديد. انسخ الرمز وقم بتشغيل الأمر التالي مع قيمة الرمز المحدد على الآلة الظاهرية الخاصة بك
+
+```
+(vm)$ huggingface-cli login --token _your_copied_token__
+
+```
+
+
+تقدم قراءة HuggingFace التعليمات البرمجية لـ PyTorch المكتوبة لتشغيلها على وحدات معالجة الرسوميات. للتشغيل على وحدات معالجة الرسوميات القابلة للبرمجة، تتمثل الخطوة الأولى في تغيير جهاز CUDA إلى جهاز XLA. يمكن القيام بذلك عن طريق استبدال السطر `pipe.to("cuda")` بالأسطر التالية:
+
+```py
+import torch_xla.core.xla_model as xm
+device = xm.xla_device()
+pipe.to(device)
+
+```
+
+
+بالإضافة إلى ذلك، من المهم ملاحظة أنه في المرة الأولى التي تقوم فيها بالاستدلال باستخدام XLA، سيستغرق الأمر وقتًا طويلاً للتجميع. على سبيل المثال، قد يستغرق وقت تجميع الاستدلال لنموذج stable diffusion XL من HuggingFace حوالي ساعة، في حين أن الاستدلال الفعلي قد يستغرق 5 ثوانٍ فقط، اعتمادًا على حجم الدفعة. وبالمثل، قد يستغرق تجميع نموذج GPT-2 حوالي 10-15 دقيقة، وبعد ذلك يصبح وقت حقبة التدريب أسرع بكثير. ويرجع ذلك إلى أن XLA يقوم ببناء رسم بياني للحساب الذي سيتم تنفيذه، ثم يقوم بتحسين هذا الرسم البياني للأجهزة المحددة التي يعمل عليها. ومع ذلك، بمجرد تجميع الرسم البياني، يمكن إعادة استخدامه للاستدلالات اللاحقة، والتي ستكون أسرع بكثير. لذلك، إذا كنت تقوم بالاستدلال مرة واحدة فقط، فقد لا تستفيد من استخدام XLA. ومع ذلك، إذا كنت تقوم بالاستدلال عدة مرات، أو إذا كنت تقوم بالاستدلال على قائمة من المطالبات، فستبدأ في رؤية مزايا XLA بعد الاستدلالات القليلة الأولى. على سبيل المثال، إذا قمت بالاستدلال على قائمة من 10 مطالبات، فقد تستغرق الاستدلال الأول (ربما اثنان [1](#fn-1)) وقتًا طويلاً للتجميع، ولكن خطوات الاستدلال المتبقية ستكون أسرع بكثير. ويرجع ذلك إلى أن XLA ستعيد استخدام الرسم البياني الذي تم تجميعه للاستدلال الأول.
+
+إذا حاولت تشغيل الكود دون إجراء أي تغييرات إضافية، فستلاحظ أن وقت التجميع طويل جدًا (>6 ساعات). ويرجع ذلك إلى أن مجمع XLA يحاول بناء رسم بياني واحد لجميع خطوات جدول المواعيد دفعة واحدة مشابهة لما ناقشناه في المثال السابق. لجعل الكود يعمل بشكل أسرع، نحتاج إلى كسر الرسم البياني إلى قطع أصغر باستخدام `xm.mark_step()` وإعادة استخدامها في الخطوات التالية. يحدث هذا داخل دالة `pipe.__call__` [function](https://github.com/huggingface/diffusers/blob/2b1786735e27bc97f4d4699712292d5c463a7380/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L559) في [هذه الأسطر](https://github.com/huggingface/diffusers/blob/2b1786735e27bc97f4d4699712292d5c463a7380/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L805-L839). يؤدي تعطيل شريط التقدم وإزالة الاستدعاءات وإضافة `xm.mark_step()` في نهاية حلقة for إلى تسريع الكود بشكل كبير. التغييرات متوفرة في هذا [التزام](https://github.com/huggingface/diffusers/compare/main...pytorch-tpu:diffusers:main).
+
+بالإضافة إلى ذلك، فإن وظيفة `self.scheduler.step()`، التي تستخدم بشكل افتراضي جدول مواعيد DPMSolverMultistepScheduler، بها بعض المشكلات الموضحة في [تحذيرات PyTorch XLA](https://pytorch.org/xla/release/2.0/index.html#known-performance-caveats). ترسل استدعاءات `.nonzero()` و`.item()` في هذه الوظيفة طلبات إلى وحدة المعالجة المركزية لتقييم المصفوفة، والتي تطلق اتصال الجهاز بالمضيف. هذا غير مرغوب فيه، لأنه يمكن أن يبطئ الكود. في هذه الحالة بالذات، يمكننا تجنب هذه الاستدعاءات عن طريق تمرير الفهرس إلى الوظيفة مباشرةً. سيمنع ذلك الوظيفة من إرسال طلبات إلى وحدة المعالجة المركزية، وسيحسن أداء الكود. التغييرات متوفرة في [هذا](https://github.com/pytorch-tpu/diffusers/commit/0243d2ef9c2c7bc06956bb1bcc92c23038f6519d) الالتزام. الكود الآن جاهز للتشغيل على وحدات معالجة TensorFlow.
+
+تحليل الأداء والتعريف به:
+
+للتحقيق بشكل أكبر في أداء النموذج، يمكننا التعريف به باستخدام دليل التعريف [هنا](https://cloud.google.com/tpu/docs/pytorch-xla-performance-profiling-tpu-vm). كقاعدة عامة، يجب تشغيل نص التعريف باستخدام حجم الدُفعة الأقصى الذي يتلاءم مع الذاكرة من أجل [الاستخدام الأمثل للذاكرة](https://cloud.google.com/tpu/docs/performance-guide). كما يساعد أيضًا على تداخل تتبع الكود مع التنفيذ على الجهاز، مما يؤدي إلى استخدام الجهاز بشكل أكثر مثالية. يجب أن تكون مدة التعريف طويلة بما يكفي لالتقاط خطوة واحدة على الأقل. تعني الأداء الجيد للنموذج على وحدات معالجة TensorFlow أن الاتصال بين الجهاز والمضيف يتم تقليله إلى الحد الأدنى وأن الجهاز يعمل باستمرار على تشغيل العمليات دون وقت توقف.
+
+بدء خادم في ملف `inference_tpu_*.py` وتشغيل نص برمجي `capture_profile.py` كما هو موضح في الدليل سيوفر لنا معلومات حول العمليات التي تعمل على الأجهزة. حاليًا، يتم التعريف بجهاز XLA واحد فقط. لفهم وقت توقف وحدة معالجة TensorFlow (الفجوات في التعريف)، يجب إضافة آثار التعريف (`xp.Trace()`) إلى الكود. يقيس `xp.Trace()` الوقت الذي يستغرقه تتبع الكود Python على جهاز المضيف الملفوف بواسطة التعريف. في هذا المثال، تمت إضافة آثار `xp.Trace()` داخل [خط الأنابيب](https://github.com/ssusie/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py) [نموذج U-net](https://github.com/ssusie/diffusers/blob/main/src/diffusers/models/unet_2d_condition.py) لقياس الوقت اللازم لتشغيل أقسام محددة من الكود على المضيف (وحدة المعالجة المركزية).
+
+إذا كانت الفجوات في التعريف ناتجة عن تتبع كود Python الذي يحدث على المضيف، فقد يكون ذلك عنق زجاجة ولا يوجد تحسين مباشر آخر يمكن القيام به. وإلا، يجب إجراء مزيد من التحليل للكود لفهم التحذيرات وتحسين الأداء بشكل أكبر. لاحظ أنه لا يمكنك لف أجزاء من الكود حيث يتم استدعاء `xm.mark_step()` بـ `xp.Trace()`.
+
+لتوضيح ذلك، يمكننا النظر في التعريفات التي تم التقاطها بالفعل والتي تم تحميلها إلى TensorBoard وفقًا لدليل التعريف.
+
+بدءًا من إصدار Stable Diffusion 2.1:
+
+إذا قمنا بالتقاط تعريف بدون إدراج أي آثار، فسنرى ما يلي:
+
+[![النص البديل](https://pytorch.org/xla/release/2.3/assets/image.png)](https://pytorch.org/xla/release/2.3/assets/image.png)
+
+يبدو أن جهاز وحدة معالجة TensorFlow الوحيد على v4-8، والذي يحتوي على نواتين، مشغول. لا توجد فجوات كبيرة في استخدامها، باستثناء واحدة صغيرة في المنتصف. إذا قمنا بالتمرير لأعلى لمحاولة العثور على العملية التي تشغل جهاز المضيف، فلن نجد أي معلومات. لذلك، سنضيف `xp.traces` إلى ملف [خط الأنابيب](https://github.com/pytorch-tpu/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py) وكذلك وظيفة [U-net](https://github.com/pytorch-tpu/diffusers/blob/main/src/diffusers/models/unet_2d_condition.py). قد لا يكون الأخير مفيدًا لهذه الحالة الاستخدامية بالذات، ولكنه يوضح كيف يمكن إضافة آثار في أماكن مختلفة وكيف يتم عرض معلوماتها في TensorBoard.
+
+إذا أضفنا آثارًا وأعدنا التقاط التعريف بحجم الدُفعة الأكبر الذي يمكن أن يتلاءم مع الجهاز (32 في هذه الحالة)، فسنرى أن الفجوة في الجهاز تسببها عملية Python تعمل على جهاز المضيف.
+
+[![النص البديل](https://pytorch.org/xla/release/2.3/assets/image-1.png)](https://pytorch.org/xla/release/2.3/assets/image-1.png) [![النص البديل](https://pytorch.org/xla/release/2.3/assets/image-2.png)](https://pytorch.org/xla/release/2.3/assets/image-2.png)
+
+يمكننا استخدام الأداة المناسبة للتكبير في التسلسل الزمني ورؤية العملية التي تعمل خلال تلك الفترة. هذا هو عندما يحدث تتبع كود Python على المضيف، ولا يمكننا تحسين التتبع أكثر من ذلك في هذه المرحلة.
+
+الآن، دعنا نلقي نظرة على إصدار XL من النموذج ونفعل الشيء نفسه. سنضيف آثارًا إلى ملف [خط الأنابيب](https://github.com/pytorch-tpu/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py) بنفس الطريقة التي فعلناها للإصدار 2.1 والتقاط تعريف.
+
+[![النص البديل](https://pytorch.org/xla/release/2.3/assets/image-4.png)](https://pytorch.org/xla/release/2.3/assets/image-4.png)
+
+هذه المرة، بالإضافة إلى الفجوة الكبيرة في المنتصف، والتي تسببها عملية `pipe_watermark`، هناك العديد من الفجوات الصغيرة بين خطوات الاستدلال داخل [هذه الحلقة](https://github.com/pytorch-tpu/diffusers/blob/0243d2ef9c2c7bc06956bb1bcc92c23038f6519d/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L814-L830).
+
+ألق نظرة فاحصة على الفجوة الكبيرة التي يسببها `pipe_watermark`. تسبق الفجوة عملية `TransferFromDevice` والتي تشير إلى أن شيئًا ما يحدث على جهاز المضيف ينتظر انتهاء الحساب قبل المتابعة. بالنظر إلى كود watermark [هنا](https://github.com/pytorch-tpu/diffusers/blob/0243d2ef9c2c7bc06956bb1bcc92c23038f6519d/src/diffusers/pipelines/stable_diffusion_xl/watermark.py#L29)، يمكننا أن نرى أنه يتم نقل المصفوفات إلى وحدة المعالجة المركزية وتحويلها إلى مصفوفات Numpy من أجل معالجتها لاحقًا باستخدام مكتبات `cv2` و`pywt`. نظرًا لأن هذا الجزء ليس من السهل تحسينه، فسنتركه كما هو.
+
+الآن إذا قمنا بالتكبير على الحلقة، يمكننا أن نرى أن الرسم البياني داخل الحلقة يتم تقسيمه إلى أجزاء أصغر لأن عملية `TransferFromDevice` تحدث.
+
+[![النص البديل](https://pytorch.org/xla/release/2.3/assets/image-3.png)](https://pytorch.org/xla/release/2.3/assets/image-3.png)
+
+إذا قمنا بالتحقيق في وظيفة U-Net وجدول المواعيد، يمكننا أن نرى أن كود U-Net لا يحتوي على أي أهداف للتحسين لـ PyTorch/XLA. ومع ذلك، هناك مكالمات `.item()` و`.nonzero()` داخل [جدول المواعيد.الخطوة](https://github.com/huggingface/diffusers/blob/15782fd506e8c4a7c2b288fc2e558bd77fdfa51a/src/diffusers/schedulers/scheduling_euler_discrete.py#L371). يمكننا [إعادة كتابة](https://github.com/pytorch-tpu/diffusers/blob/0243d2ef9c2c7bc06956bb1bcc92c23038f6519d/src/diffusers/schedulers/scheduling_euler_discrete.py#L310) الوظيفة لتجنب تلك المكالمات. إذا قمنا بإصلاح هذه المشكلة وأعدنا تشغيل التعريف، فلن نرى الكثير من الاختلاف. ومع ذلك، نظرًا لأننا قللنا من الاتصال بين الجهاز والمضيف الذي كان يقدم رسومًا بيانية أصغر، فقد سمحنا للمترجم بتحسين الكود بشكل أفضل. تحتوي وظيفة [scale_model_input](https://github.com/huggingface/diffusers/blob/15782fd506e8c4a7c2b288fc2e558bd77fdfa51a/src/diffusers/schedulers/scheduling_euler_discrete.py#L205) على مشكلات مماثلة، ويمكننا إصلاحها عن طريق إجراء التغييرات التي أجريناها أعلاه على وظيفة `الخطوة`. بشكل عام، نظرًا لأن العديد من الفجوات ناتجة عن تتبع كود مستوى Python وبناء الرسوم البيانية، فمن غير الممكن تحسين هذه الفجوات باستخدام الإصدار الحالي من PyTorch XLA، ولكن قد نرى تحسينات في المستقبل عندما يتم تمكين الدينامو في PyTorch XLA.
+
+تشغيله على أجهزة TPU متعددة
+------------------------------------------------------------------------------------------------
+
+لاستخدام أجهزة TPU متعددة، يمكنك استخدام وظيفة `xmp.spawn` لتشغيل الوظيفة التي قمت بتشغيلها على جهاز واحد على أجهزة متعددة. ستبدأ وظيفة `xmp.spawn` العمليات على أجهزة TPU متعددة وتزامنها عند الحاجة. يمكن القيام بذلك عن طريق تمرير وسيطة `index` إلى الوظيفة التي تعمل على جهاز واحد. على سبيل المثال،
+
+```py
+import torch_xla.distributed.xla_multiprocessing as xmp
+
+def my_function(index):
+  # function that runs on a single device
+
+xmp.spawn(my_function, args=(0,), nprocs=4)
+
+```
+
+
+في هذا المثال، سيتم تشغيل وظيفة `my_function` على 4 أجهزة TPU على v4-8، مع تعيين كل جهاز فهرسًا من 0 إلى 3.
+
+يوضح [هذا الملف](https://github.com/ssusie/diffusers/blob/main/examples/text_to_image/inference_tpu_multidevice.py) كيفية استخدام xmp.spawn لتشغيل إصدار Stable Diffusion 2.1 على أجهزة TPU متعددة. بالنسبة لهذا الإصدار، تم إجراء تغييرات مماثلة على ملف [خط الأنابيب](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py).
+
+تشغيله على القرون
+----------------------------------------------------------------
+
+بمجرد حصولك على الكود لتشغيله على جهاز مضيف واحد، لا يلزم إجراء أي تغيير آخر. يمكنك إنشاء قرن وحدة معالجة TensorFlow، على سبيل المثال، باتباع هذه [التعليمات](https://cloud.google.com/tpu/docs/pytorch-pods#create-tpu-vm). ثم قم بتشغيل نصك البرمجي باستخدام
+
+```bash
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+  --zone=${ZONE} \
+  --worker=all \
+  --command="python3 your_script.py"
+
+```
+
+
+[1](#id10)
+
+0 و1 هما أرقام سحرية في XLA ويعاملان على أنهما ثابتان في HLO. لذا، إذا كان هناك مولد أرقام عشوائية في الكود يمكنه توليد هذه القيم، فسيتم تجميع الكود لكل قيمة على حدة. يمكن تعطيل ذلك باستخدام متغير البيئة `XLA_NO_SPECIAL_SCALARS=1`.
+
+استكشاف الأخطاء وإصلاحها
+----------------------------------------------------------------
+
+لاحظ أن المعلومات الواردة في هذا القسم عرضة للإزالة في الإصدارات المستقبلية من برنامج _PyTorch/XLA_، حيث إن العديد منها خاص بتنفيذ داخلي معين قد يتغير.
+
+التحقق من الصحة
+----------------------------------------------------------
+
+قبل إجراء أي تصحيح للأخطاء المعقدة، نريد إجراء فحص للصحة العقلية على PyTorch/XLA المثبت.
+
+### التحقق من إصدار PyTorch/XLA
+
+يجب أن تتطابق إصدارات PyTorch وPyTorch/XLA. تحقق من [ملف README](https://github.com/pytorch/xla#getting-started) الخاص بنا للحصول على مزيد من التفاصيل حول الإصدارات المتاحة.
+
+```bash
+vm:~$ python
+>>> import torch
+>>> import torch_xla
+>>> print(torch.__version__)
+2.1.0+cu121
+>>> print(torch_xla.__version__)
+2.1.0
+
+```
+
+
+### إجراء عملية حسابية بسيطة
+
+```bash
+vm:~$ export PJRT_DEVICE=TPU
+vm:~$ python3
+>>> import torch
+>>> import torch_xla.core.xla_model as xm
+>>> t1 = torch.tensor(100, device=xm.xla_device())
+>>> t2 = torch.tensor(200, device=xm.xla_device())
+>>> print(t1 + t2)
+tensor(300, device='xla:0')
+
+```
+
+
+### تشغيل ResNet ببيانات وهمية
+
+للإصدار الليلي
+
+```bash
+vm:~$ git clone https://github.com/pytorch/xla.git
+vm:~$ python xla/test/test_train_mp_imagenet.py --fake_data
+
+```
+
+
+بالنسبة للإصدار المطلق `x.y`، تريد استخدام الفرع `rx.y`. على سبيل المثال، إذا قمت بتثبيت الإصدار 2.1، فيجب عليك القيام بما يلي
+
+```bash
+vm:~$ git clone --branch r2.1 https://github.com/pytorch/xla.git
+vm:~$ python xla/test/test_train_mp_imagenet.py --fake_data
+
+```
+
+
+إذا تمكنت من تشغيل ResNet، فيمكننا الاستنتاج بأن PyTorch_xla مثبت بشكل صحيح.
+
+تصحيح أخطاء الأداء
+----------------------------------------------------------------------------
+
+لتشخيص مشكلات الأداء، يمكننا استخدام مقاييس العدادات ومقاييس التنفيذ التي يوفرها _PyTorch/XLA_ أول شيء يتم التحقق منه عند بطء النموذج هو إنشاء تقرير بالمقاييس.
+
+تقرير المقاييس مفيد للغاية في تشخيص المشكلات. يرجى محاولة تضمينه في تقرير الأخطاء المرسل إلينا إذا كان لديك.
+
+الحصول على تقرير بالمقاييس
+--------------------------------------------------------------------------
+
+ضع السطر التالي في برنامجك لإنشاء تقرير:
+
+```py
+import torch_xla.debug.metrics as met
+
+# للحصول على تقرير قصير يحتوي فقط على بعض المقاييس الرئيسية.
+print(تقرير met.short_metrics_report())
+# للحصول على تقرير كامل يتضمن جميع المقاييس.
+print(تقرير met.metrics_report())
+
+```
+
+فهم تقرير المقاييس
+--------------------------------------------------------------------------------------------
+
+يشمل التقرير أشياء مثل:
+
+*   عدد المرات التي نصدر فيها عمليات التجميع في XLA والوقت المستغرق في الإصدار.
+    
+*   عدد المرات التي نقوم فيها بالتنفيذ والوقت المستغرق في التنفيذ
+    
+*   عدد مقابض بيانات الجهاز التي نقوم بإنشائها/تدميرها، وما إلى ذلك.
+    
+
+يتم الإبلاغ عن هذه المعلومات من حيث المئينات للعينات. مثال على ذلك:
+
+```bash
+Metric: CompileTime
+  TotalSamples: 202
+  Counter: 06m09s401ms746.001us
+  ValueRate: 778ms572.062us / second
+  Rate: 0.425201 / second
+  Percentiles: 1%=001ms32.778us; 5%=001ms61.283us; 10%=001ms79.236us; 20%=001ms110.973us; 50%=001ms228.773us; 80%=001ms339.183us; 90%=001ms434.305us; 95%=002ms921.063us; 99%=21s102ms853.173us
+
+```
+
+
+نقدم أيضًا العدادات، والتي تكون متغيرات صحيحة مسماة والتي تقوم بتتبع حالة البرنامج الداخلية. على سبيل المثال:
+
+```bash
+Counter: CachedSyncTensors
+  Value: 395
+
+```
+
+
+في هذا التقرير، يشير أي عداد يبدأ بـ `aten::` إلى تبديل السياق بين جهاز XLA ووحدة المعالجة المركزية، والذي يمكن أن يكون مجالًا محتملًا لتحسين الأداء في كود النموذج.
+
+تُستخدم العدادات لفهم العمليات التي تتم إعادتها إلى محرك CPU في PyTorch. يتم تمييزها بالكامل باستخدام مساحة الاسم C++ الخاصة بها:
+
+```bash
+Counter: aten::nonzero
+  Value: 33
+
+```
+
+
+إذا رأيت عمليات `aten::` بخلاف `nonzero` و`_local_scalar_dense`، فهذا يعني عادةً وجود خفض مفقود في PyTorch/XLA. لا تتردد في فتح طلب ميزة لذلك على [مشكلات GitHub](https://github.com/pytorch/xla/issues).
+
+مسح تقرير المقاييس
+----------------------------------------------------------------------------------
+
+إذا كنت تريد مسح المقاييس بين الخطوات/العصور، فيمكنك استخدام
+
+```py
+import torch_xla.debug.metrics باسم met
+
+met.clear_all()
+
+```
+
+
+تحذيرات الأداء المعروفة
+------------------------------------------------------------------------------------
+
+يتصرف PyTorch/XLA دلاليًا مثل PyTorch العادي وتشارك مصفوفات XLA واجهة المصفوفة الكاملة مع مصفوفات وحدة المعالجة المركزية ووحدة معالجة الرسومات. ومع ذلك، تشير القيود في XLA/الأجهزة ونموذج التقييم الكسول إلى أن بعض الأنماط قد تؤدي إلى ضعف الأداء.
+
+إذا أظهر نموذجك ضعف الأداء، ضع في اعتبارك التحذيرات التالية:
+
+1.  **تؤدي XLA/TPU إلى تدهور الأداء مع الكثير من عمليات إعادة التجميع.**
+    
+    التجميع في XLA مكلف. يقوم PyTorch/XLA تلقائيًا بإعادة تجميع الرسم البياني في كل مرة يتم فيها العثور على أشكال جديدة. عادةً ما يجب أن تستقر النماذج في غضون بضع خطوات ويمكنك رؤية تسريع كبير لبقية التدريب.
+    
+    لتجنب عمليات إعادة التجميع، يجب ألا تكون الأشكال ثابتة فحسب، بل يجب أن تكون الحسابات عبر أجهزة XLA في جميع المضيفين ثابتة أيضًا.
+    
+    _مصادر محتملة_:
+    
+    *   تؤدي الاستخدامات المباشرة أو غير المباشرة لـ `nonzero` إلى أشكال ديناميكية؛ على سبيل المثال، الفهرسة المقنعة `base[index]` حيث `index` هو قناع المصفوفة.
+        
+    *   يمكن أن تؤدي الحلقات التي تحتوي على عدد مختلف من التكرارات بين الخطوات إلى رسومات تنفيذ مختلفة، وبالتالي تتطلب عمليات إعادة تجميع.
+        
+    
+    _الحل_:
+    
+    *   يجب أن تكون أشكال المصفوفة هي نفسها بين التكرارات، أو يجب استخدام عدد صغير من تباينات الشكل.
+        
+    *   قم بتبطين المصفوفات إلى أحجام ثابتة عند الإمكان.
+        
+2.  **لا يوجد لبعض العمليات ترجمات أصلية إلى XLA.**
+    
+    بالنسبة لهذه العمليات، يقوم PyTorch/XLA تلقائيًا بنقلها إلى ذاكرة وحدة المعالجة المركزية، وتقييمها على وحدة المعالجة المركزية، وإعادة النتيجة مرة أخرى إلى جهاز XLA. يؤدي إجراء العديد من هذه العمليات أثناء خطوة التدريب إلى تباطؤ كبير.
+    
+    _مصادر محتملة_:
+    
+    *   تطلب عملية `item()` صراحةً تقييم النتيجة. لا تستخدمها إلا إذا لزم الأمر.
+        
+    
+    _الحل_:
+    
+    *   بالنسبة لمعظم العمليات، يمكننا خفضها إلى XLA لإصلاحها. تحقق من [قسم تقرير المقاييس](#metrics-report) لمعرفة العمليات المفقودة وقم بفتح طلب ميزة على [GitHub](https://github.com/pytorch/xla/issues).
+        
+    *   حتى عندما تكون مصفوفة PyTorch معروفة على أنها مقياس، تجنب استخدام `tensor.item()`. احتفظ بها كمصفوفة وقم بعمليات المصفوفة عليها.
+        
+    *   استخدم `torch.where` لاستبدال تدفق التحكم عند الاقتضاء. على سبيل المثال، تدفق التحكم مع `item()` المستخدم في [clip_grad\*norm\*](https://github.com/pytorch/pytorch/blob/de19eeee99a2a282fc441f637b23d8e50c75ecd1/torch/nn/utils/clip_grad.py#L33) يمثل مشكلة ويؤثر على الأداء، لذا فقد قمنا [بالتصحيح](https://github.com/pytorch/xla/blob/master/torch_patches/X10-clip_grad.diff) `clip_grad_norm_` عن طريق استدعاء `torch.where` بدلاً من ذلك، مما يمنحنا تحسنًا كبيرًا في الأداء. .. 
+    
+    ```py
+        
+        > … else:
+        > 
+        > > device = parameters\[0\].device total\_norm = torch.zeros(\[\], device=device if parameters else None) for p in parameters:
+        > > 
+        > > > param\_norm = p.grad.data.norm(norm\_type) \*\* norm\_type total\_norm.add\_(param\_norm)
+        > > 
+        > > total\_norm = (total\_norm \*\* (1. / norm\_type))
+        > 
+        > clip\_coef = torch.tensor(max\_norm, device=device) / (total\_norm + 1e-6) for p in parameters:
+        > 
+        > > p.grad.data.mul\_(torch.where(clip\_coef < 1, clip\_coef, torch.tensor(1., device=device)))
+    ```
+
+3.  **قد يؤدي استخدام المؤشرات في `torch_xla.distributed.data_parallel` إلى إسقاط الدُفعات القليلة الأخيرة في مؤشر المدخلات.**
+    
+    هذا للتأكد من أننا نقوم بنفس الكمية من العمل على جميع أجهزة XLA.
+    
+    _الحل_:
+    
+    *   عندما تكون مجموعة البيانات صغيرة، وهناك عدد قليل جدًا من الخطوات، فقد يؤدي ذلك إلى حقبة فارغة. لذلك، من الأفضل استخدام أحجام دفعات صغيرة في تلك الحالات.
+        
+
+غريب الأطوار المصفوفة XLA
+--------------------------------------------------------------------
+
+1.  **داخليات المصفوفة XLA غير واضحة.** دائمًا ما تبدو مصفوفات XLA متجاورة وبدون تخزين. يجب ألا تحاول الشبكات التحقق من خطوات مصفوفات XLA.
+    
+2.  **يجب نقل مصفوفات XLA إلى وحدة المعالجة المركزية قبل حفظها.** يؤدي حفظ مصفوفات XLA مباشرةً إلى تحميلها مرة أخرى على الجهاز (الأجهزة) التي تم حفظها منها. إذا كان الجهاز غير متوفر عند التحميل، فسوف يفشل التحميل. يؤدي نقل مصفوفات XLA إلى وحدة المعالجة المركزية قبل حفظها إلى السماح لك بالتحكم في الجهاز (الأجهزة) الذي سيتم وضع المصفوفات المحملة عليه. هذا ضروري إذا كنت تريد تحميل المصفوفات على جهاز بدون أجهزة XLA. يجب توخي الحذر عند نقل مصفوفات XLA إلى وحدة المعالجة المركزية قبل حفظها، ومع ذلك، نظرًا لأن نقل المصفوفات عبر أنواع الأجهزة لا يحافظ على علاقات العرض. بدلاً من ذلك، يجب إعادة إنشاء العروض حسب الاقتضاء بعد تحميل المصفوفات.
+    
+3.  **نسخ مصفوفة XLA باستخدام نسخة Python.copy يعيد نسخة عميقة، وليس نسخة ضحلة.** استخدم طريقة عرض مصفوفة XLA للحصول على نسخة ضحلة منها.
+    
+4.  **التعامل مع الأوزان المشتركة.** يمكن للوحدات النمطية مشاركة الأوزان عن طريق تعيين معلمات وحدة نمطية واحدة إلى أخرى. يجب أن يتم هذا "ربط" أوزان الوحدة النمطية **بعد** نقل الوحدات النمطية إلى جهاز XLA. وإلا، فسيتم إجراء نسختين مستقلتين من المصفوفة المشتركة على جهاز XLA.
+    
+
+وقت تشغيل PJRT
+----------------------------------------------------------
+
+هاجر PyTorch/XLA من وقت تشغيل XRT القائم على TensorFlow إلى وقت تشغيل [PJRT](https://github.com/openxla/xla/tree/main/xla/pjrt) الذي يستخدمه [JAX](https://github.com/google/jax).
+
+إذا صادفت خطأ في PJRT، يرجى تقديم مشكلة على GitHub مع علامة `runtime`.
+
+_ميزات جديدة في PyTorch/XLA r2.1_:
+
+*   PJRT مستقر في PyTorch/XLA r2.1!
+    
+*   انتقلت واجهات برمجة التطبيقات العامة للوقت في الوقت الفعلي من `torch_xla.experimental.pjrt` إلى `torch_xla.runtime`.
+    
+    *   تمت إعادة تسمية طريقة init `pjrt://` إلى `xla://`، وهي مسجلة بواسطة `torch_xla.distributed.xla_backend`.
+        
+    *   لا تزال الأسماء السابقة `torch_xla.experimental.*` متوفرة في هذا الإصدار للتوافق.
+        
+*   `torchrun` مدعوم الآن عند استخدام `init_method='xla://'`.
+    
+*   إضافات جديدة لـ XPU وNeuron عبر واجهة برمجة تطبيقات C في PJRT.
+    
+
+_ميزات جديدة في PyTorch/XLA r2.0_:
+
+*   سيتم تكوين PJRT بشكل افتراضي إذا لم تقم بتمرير أي تكوين وقت تشغيل آخر. إذا كنت لا تزال تقوم بتعيين تكوين XRT (`XRT_TPU_CONFIG`)، فلن يؤثر هذا التغيير عليك
+    
+*   تنفيذ وقت تشغيل TPU الجديد في `libtpu` يحسن الأداء بنسبة تصل إلى 30%.
+    
+*   تنفيذ جديد لـ `xm.rendezvous` يمكنه التوسع إلى آلاف من شرائح TPU
+    
+*   \[تجريبي\] دعم `torch.distributed` لـ TPU v2 وv3، بما في ذلك `pjrt://` `init_method`
+    
+
+TL؛ DR
+--------------------------------------------
+
+*   لاستخدام معاينة وقت تشغيل PJRT، قم بتعيين متغير البيئة `PJRT_DEVICE` على `CPU` أو `TPU` أو `CUDA`
+    
+*   في XRT، تكون جميع أعباء العمل الموزعة متعددة العمليات، مع عملية واحدة لكل جهاز. على TPU v2 وv3 في PJRT، تكون أعباء العمل متعددة العمليات ومتعددة الخيوط (4 عمليات مع خيطين لكل منها)، لذا يجب أن يكون عبء العمل الخاص بك آمنًا للخيوط. راجع [تعدد الخيوط على TPU v2/v3](#multithreading-on-tpu-v2v3) و[قسم تعدد العمليات في دليل واجهة برمجة التطبيقات](https://github.com/pytorch/xla/blob/master/API_GUIDE.md#running-on-multiple-xla-devices-with-multi-processing) لمزيد من المعلومات. الاختلافات الرئيسية التي يجب مراعاتها:
+    
+    *   لتهيئة نموذج بطريقة آمنة للخيوط، قم إما ببث معلمات عبر النسخ المتماثلة بعد التهيئة (`torch_xla.experimental.pjrt.broadcast_master_param`) أو قم بتحميل معلمات كل نسخة متماثلة من نقطة تفتيش مشتركة.
+        
+    *   بالنسبة لتوليد الأرقام العشوائية الأخرى، استخدم `torch.Generator` حيثما أمكن ذلك. لا تعتبر RNG العالمية في PyTorch آمنة للخيوط، حتى إذا قمت بتعيين نفس `torch.manual_seed` عبر النسخ المتماثلة.
+        
+    *   لاستخدام `torch.distributed`، قم بimport `torch_xla.experimental.pjrt_backend` واستخدام `xla://` `init_method`.
+        
+    *   هذه الخطوات اختيارية لوحدة معالجة الرسومات وTPU v4.
+        
+
+عينة diff من XRT إلى PJRT:
+
+```diff
+
+ import os
+
+ import torch
+ import torch.nn as nn
+ from torch.nn.parallel import DistributedDataParallel as DDP
+ import torch.optim as optim
+ import torch.distributed as dist
+ import torch_xla.core.xla_model as xm
+ import torch_xla.distributed.parallel_loader as pl
+ import torch_xla.distributed.xla_backend
+ import torch_xla.distributed.xla_multiprocessing as xmp
++import torch_xla.runtime as xr
+
+
+ def _mp_fn(index):
+   device = xm.xla_device()
+-  dist.init_process_group('xla', rank=xm.get_ordinal(), world_size=xm.xrt_world_size())
++  dist.init_process_group('xla', init_method='xla://')
+
+   torch.manual_seed(42)
+   model = nn.Linear(128, 10).to(device)
+
++  # Optional for TPU v4 and GPU
++  xm.broadcast_master_param(model)
+   model = DDP(model, gradient_as_bucket_view=True)
+
+   loss_fn = nn.MSELoss()
+   optimizer = optim.SGD(model.parameters(), lr=.001)
+
+   for i in range(10):
+     data, target = torch.randn((128, 128), device=device), torch.randn((128, 10), device=device)
+
+     optimizer.zero_grad()
+     output = model(data)
+     loss = loss_fn(output, target)
+     loss.backward()
+
+     optimizer.step()
+     xm.mark_step()
+
+   # Print mean parameters so we can confirm they're the same across replicas
+   print([p.mean() for p in model.parameters()])
+
+ if __name__ == '__main__':
+-  os.environ['XRT_TPU_CONFIG'] = 'localservice;0;localhost:51011'
+-  os.environ['MASTER_ADDR'] = 'localhost'
+-  os.environ['MASTER_PORT'] = '12355'
+
++  # Recommended: set PJRT_DEVICE to your local device type
++  os.environ['PJRT_DEVICE'] = 'TPU'
+
+   xmp.spawn(_mp_fn)
+
+```
+
+
+الفوائد
+--------------------------------------------------
+
+*   تكوين وقت التشغيل البسيط: قم فقط بتعيين `PJRT_DEVICE` إلى `TPU` أو `CPU` أو `CUDA` وابدأ في استخدام XLA! أو، دع PJRT يختار جهازًا تلقائيًا بناءً على بيئتك.
+    
+*   تحسين الأداء: تقليل النفقات العامة من gRPC يعني تنفيذ أسرع من النهاية إلى النهاية. في TorchBench 2.0، لاحظنا تحسنًا بنسبة تزيد عن 35% في وقت التدريب على TPU v4.
+    
+*   سهولة تنفيذ القرون: ما عليك سوى نسخ الكود الخاص بك إلى كل عامل TPU، وتشغيلها جميعًا في نفس الوقت باستخدام `gcloud compute tpus tpuvm ssh --worker=all`.
+    
+*   تحسين النطاق: يزيل [قيود XRT على أحجام المعلمات](https://github.com/pytorch/xla/pull/3920) ويدعم ما يصل إلى 2048 شريحة TPU.
+
+بدء سريع
+------------------------------------------------------
+
+لبدء استخدام PJRT مع PyTorch/XLA، كل ما عليك فعله هو تعيين متغير البيئة `PJRT_DEVICE`. إذا كنت تعمل على TPU v2 أو v3، فاستمر في القراءة لمعرفة الاختلافات بين TPU v2 وv3 وv4.
+
+### وحدة المعالجة المركزية
+
+على أي جهاز مثبت عليه PyTorch/XLA، يمكنك تشغيل مثال MNIST الخاص بنا على وحدة المعالجة المركزية مثل هذا:
+
+```bash
+PJRT_DEVICE=CPU python3 xla/test/test_train_mp_mnist.py --fake_data
+
+```
+
+
+### وحدة معالجة TensorFlow
+
+لإنشاء وحدة معالجة TensorFlow جديدة مثبت عليها PyTorch/XLA r2.0:
+
+```bash
+gcloud alpha compute tpus tpu-vm create $USER-pjrt --accelerator-type=v4-8 --version=tpu-vm-v4-pt-2.0 --zone=us-central2-b --project=$PROJECT
+
+```
+
+
+على v4-8، يمكنك تشغيل مثال ResNet50 الخاص بنا مثل هذا:
+
+```bash
+git clone --depth=1 --branch r2.0 https://github.com/pytorch/xla.git
+PJRT_DEVICE=TPU python3 xla/test/test_train_mp_imagenet.py --fake_data --batch_size=256 --num_epochs=1
+
+```
+
+
+بشكل افتراضي، سيستخدم PJRT جميع شرائح وحدة معالجة TensorFlow. لاستخدام شريحة وحدة معالجة TensorFlow واحدة فقط، قم بتكوين `TPU_PROCESS_BOUNDS` و`TPU_VISIBLE_CHIPS`:
+
+```bash
+TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0 PJRT_DEVICE=TPU python3 xla/test/test_train_mp_imagenet.py --fake_data --batch_size=256 --num_epochs=1
+
+```
+
+
+#### gcloud
+
+على gcloud وحدة معالجة TensorFlow، استخدم `gcloud` لتشغيل أمرك على كل وحدة معالجة TensorFlow بالتوازي:
+
+```bash
+gcloud alpha compute tpus tpu-vm ssh $USER-pjrt --zone=us-central2-b --project=$PROJECT --worker=all --command="git clone --depth=1 --branch r1.13 https://github.com/pytorch/xla.git"
+gcloud alpha compute tpus tpu-vm ssh $USER-pjrt --zone=us-central2-b --project=$PROJECT --worker=all --command="PJRT_DEVICE=TPU python3 xla/test/test_train_mp_imagenet.py --fake_data --batch_size=256 --num_epochs=1"
+
+```
+
+
+#### Docker
+
+يمكنك أيضًا استخدام Docker لتشغيل عبء العمل الخاص بك في حاوية مع تثبيت PyTorch/XLA مسبقًا:
+
+``` yml
+export DOCKER_IMAGE=gcr.io/...
+
+# اختياري: المصادقة على Docker إذا كانت صورتك في مستودع GCP الخاص
+gcloud compute tpus tpu-vm ssh $USER-pjrt --zone=us-central2-b --project=$PROJECT --worker=all --command "sudo gcloud auth configure-docker"
+
+# تشغيل عبء العمل الخاص بك
+gcloud compute tpus tpu-vm ssh $USER-pjrt --zone=us-central2-b --project=$PROJECT --worker=all --command "sudo docker run --rm --privileged --net=host -e PJRT_DEVICE=TPU $DOCKER_IMAGE python pytorch/xla/test/test_train_mp_imagenet.py --fake_data"
+
+```
+
+
+لاحظ أن `docker run` يتطلب الوصول المميز إلى المضيف (`--privileged`) لتعريض جهاز وحدة معالجة TensorFlow للحاوية. يتم دعم Docker على قرون وحدة معالجة TensorFlow فقط مع شبكة المضيف `--net=host` في هذا الوقت. راجع [وثائق Cloud TPU](https://cloud.google.com/tpu/docs/run-in-container) لمزيد من المعلومات.
+
+### وحدة معالجة الرسومات
+
+### التدريب على عقدة GPU واحدة
+
+لاستخدام وحدات معالجة الرسومات مع PJRT، قم ببساطة بتعيين `PJRT_DEVICE=CUDA` وقم بتكوين `GPU_NUM_DEVICES` لعدد الأجهزة الموجودة على المضيف. على سبيل المثال:
+
+```bash
+PJRT_DEVICE=CUDA GPU_NUM_DEVICES=4 python3 xla/test/test_train_mp_imagenet.py --fake_data --batch_size=128 --num_epochs=1
+
+```
+
+
+يمكنك أيضًا استخدام `torchrun` لبدء التدريب متعدد وحدات معالجة الرسومات للعقدة الواحدة. على سبيل المثال،
+
+```bash
+PJRT_DEVICE=CUDA torchrun --nnodes 1 --nproc-per-node ${NUM_GPU_DEVICES} xla/test/test_train_mp_imagenet.py --fake_data --pjrt_distributed --batch_size=128 --num_epochs=1
+
+```
+
+
+في المثال أعلاه، يعني `--nnodes` عدد الآلات (الآلات المادية أو VMs) التي سيتم استخدامها (فهي 1 منذ أن نقوم بالتدريب على عقدة واحدة). يعني `--nproc-per-node` عدد أجهزة وحدات معالجة الرسومات التي سيتم استخدامها.
+
+### التدريب متعدد العقد لوحدة معالجة الرسومات
+
+**لاحظ أن هذه الميزة تعمل فقط لـ cuda 12+**. على غرار كيفية استخدام PyTorch للتدريب متعدد العقد، يمكنك تشغيل الأمر كما هو موضح أدناه:
+
+```bash
+PJRT_DEVICE=CUDA torchrun \
+--nnodes=${NUMBER_GPU_VM} \
+--node_rank=${CURRENT_NODE_RANK} \
+--nproc_per_node=${NUMBER_LOCAL_GPU_DEVICES} \
+--rdzv_endpoint=<internal_ip_address:port> multinode_training.py
+
+```
+
+
+*   `--nnodes`: عدد آلات وحدات معالجة الرسومات التي سيتم استخدامها.
+    
+*   `--node_rank`: فهرس آلات وحدات معالجة الرسومات الحالية. يمكن أن تكون القيمة 0 أو 1 أو …، ${NUMBER\_GPU\_VM}-1.
+    
+*   `--nproc_per_node`: عدد أجهزة وحدات معالجة الرسومات التي سيتم استخدامها على الجهاز الحالي.
+    
+*   –rdzv\_endpoint: نقطة نهاية آلة وحدة معالجة الرسومات مع node\_rank==0، في شكل host:port\`. The\`\`host`will تكون عنوان IP الداخلي. يمكن أن يكون `port\` أي منفذ متاح على الجهاز. بالنسبة للتدريب/الاستدلال على عقدة واحدة، يمكن إغفال هذا المعلمة.
+    
+
+على سبيل المثال، إذا كنت تريد التدريب على آلتين لوحدة معالجة الرسومات: machine\_0 وmachine\_1، على أول آلة لوحدة معالجة الرسومات machine\_0، قم بتشغيل
+
+```bash
+# PJRT_DEVICE=CUDA torchrun \
+--nnodes=2 \
+--node_rank=0 \
+--nproc_per_node=4 \
+--rdzv_endpoint="<MACHINE_0_INTERNAL_IP_ADDRESS>:12355" pytorch/xla/test/test_train_mp_imagenet.py --fake_data --pjrt_distributed --batch_size=128 --num_epochs=1
+
+```
+
+
+على آلة وحدة معالجة الرسومات الثانية، قم بتشغيل
+
+```bash
+# PJRT_DEVICE=CUDA torchrun \
+--nnodes=2 \
+--node_rank=1 \
+--nproc_per_node=4 \
+--rdzv_endpoint="<MACHINE_0_INTERNAL_IP_ADDRESS>:12355" pytorch/xla/test/test_train_mp_imagenet.py --fake_data --pjrt_distributed --batch_size=128 --num_epochs=1
+
+```
+
+
+الفرق بين الأمرين أعلاه هو `--node_rank` وربما `--nproc_per_node` إذا كنت تريد استخدام عدد مختلف من أجهزة وحدات معالجة الرسومات على كل آلة. كل شيء آخر متطابق. لمزيد من المعلومات حول `torchrun`، يرجى الرجوع إلى هذه [الصفحة](https://pytorch.org/docs/stable/elastic/run.html).
+
+الاختلافات من XRT
+--------------------------------------------------------------------------
+
+على الرغم من أنه في معظم الحالات نتوقع أن يعمل PJRT وXRT بشكل متبادل بشكل أساسي من منظور المستخدم النهائي (خاصة على TPU v4)، إلا أن هناك بعض الاختلافات الدقيقة التي يجب مراعاتها. من المهم أن XRT تم تصميمه حول بنية عقدة وحدة معالجة TensorFlow، لذا فهو دائمًا ما ينشئ عميلًا وعملية خادم، حتى على أجهزة افتراضية لوحدة معالجة TensorFlow. وبالتالي، فإن كل دفعة من المدخلات بها تأخير إضافي من تسلسل البيانات وإلغاء تسلسلها لإرسالها عبر الشبكة.
+
+يستخدم PJRT الجهاز المحلي مباشرة دون عملية خادم وسيطة. في التكوين الافتراضي، سيقوم PJRT بإنشاء عملية واحدة لكل شريحة وحدة معالجة TensorFlow، أو 4 عمليات لكل مضيف وحدة معالجة TensorFlow. راجع [وثائق Cloud TPU](https://cloud.google.com/tpu/docs/system-architecture-tpu-vm) لمزيد من المعلومات حول بنية وحدة معالجة TensorFlow.
+
+*   يمكن تحقيق مكاسب الأداء للأحمال التي تعاني من قيود النفقات العامة من gRPC.
+    
+*   في ظل XRT، تكون عملية الخادم هي العملية الوحيدة التي تتفاعل مع أجهزة وحدة معالجة TensorFlow، وعمليات العميل ليس لها حق الوصول المباشر إلى أجهزة وحدة معالجة TensorFlow. عند التعريف بجهاز وحدة معالجة TensorFlow واحد (على سبيل المثال، v3-8 أو v4-8)، فستشاهد عادةً 8 آثار جهاز (واحد لكل نواة وحدة معالجة TensorFlow). مع PJRT، تحتوي كل عملية على شريحة واحدة، وسيوضح التعريف من تلك العملية نواتين فقط لوحدة معالجة TensorFlow.
+    
+    *   لنفس السبب، لا يعمل التعريف على قرون وحدة معالجة TensorFlow مع XRT، لأن عملية الخادم تعمل بشكل مستقل عن كود نموذج المستخدم. لا يحتوي PJRT على هذا القيد، لذا من الممكن التعريف باستخدام نواتين لوحدة معالجة TensorFlow لكل عملية في قرن وحدة معالجة TensorFlow.
+        
+*   يدعم PJRT فقط بنية VM لوحدة معالجة TensorFlow وليس لدينا خطط لدعم بنية عقدة وحدة معالجة TensorFlow مع PJRT.
+    
+*   تكوين وقت التشغيل أبسط بكثير مع PJRT. `xla_dist` غير مطلوب لتشغيل أعباء عمل قرن وحدة معالجة TensorFlow. بدلاً من ذلك، قم بنسخ الكود الخاص بك إلى كل مضيف وحدة معالجة TensorFlow (`[gcloud compute tpus tpu-vm scp](https://cloud.google.com/sdk/gcloud/reference/alpha/compute/tpus/tpu-vm/scp)`) وقم بتشغيل الكود على كل مضيف بالتوازي (على سبيل المثال، `[gcloud compute tpus tpu-vm ssh --workers=all --command="PJRT_DEVICE=TPU python run.py"](https://cloud.google.com/sdk/gcloud/reference/alpha/compute/tpus/tpu-vm/ssh)`)
+    
+*   تمت إعادة تنفيذ `xm.rendezvous` باستخدام الاتصال الجماعي الأصلي لـ XLA لتعزيز الاستقرار على قرون وحدة معالجة TensorFlow الكبيرة. راجع أدناه لمزيد من التفاصيل.
+
+### تعدد الخيوط على TPU v2/v3
+
+على TPU v2 وv3، **تتم دائمًا تشغيل أعباء العمل الموزعة متعددة الخيوط**، نظرًا لأن كل نواة وحدة معالجة TensorFlow تعرض نواتين لوحدة معالجة TensorFlow كأجهزة ولا يمكن إلا لعملية واحدة فتح شريحة وحدة معالجة TensorFlow في كل مرة. في تكوينه الافتراضي، يقوم `xmp.spawn` تلقائيًا بإنشاء أكبر عدد ممكن من العمليات (4 لكل مضيف وحدة معالجة TensorFlow) وإنشاء خيطين لكل عملية (واحد لكل نواة وحدة معالجة TensorFlow).
+
+ملاحظة: على TPU v4، يتم تمثيل كل شريحة وحدة معالجة TensorFlow على أنها جهاز PyTorch واحد، لذا فإن أعباء العمل الموزعة ستعمل عبر 4 عمليات، كل منها بخيط واحد فقط. هذا مطابق لسلوك XRT.
+
+في معظم الحالات، لن يتطلب ذلك إجراء تغييرات كبيرة على الكود الموجود لديك. التغيير الرئيسي الذي سيتعين عليك إجراؤه في معظم الحالات هو تهيئة النموذج. نظرًا لأن RNG العالمي في `torch` مشترك بين الخيوط، ستختلف النتائج بين الخيوط والتشغيل حتى إذا قمت بتعيين `torch.manual_seed` إلى نفس القيمة في كل نسخة متماثلة. للحصول على معلمات متسقة بين النسخ المتماثلة، استخدم إما `torch_xla.experimental.pjrt.broadcast_master_param` لبث معلمات إحدى النسخ المتماثلة إلى جميع النسخ المتماثلة الأخرى، أو قم بتحميل معلمات كل نسخة متماثلة من نقطة تفتيش مشتركة.
+
+### التغييرات على xm.rendezvous
+
+_جديد في PyTorch/XLA r2.0_
+
+مع XRT، يقوم العامل 0 بتشغيل خدمة شبكة رئيسية، وتتصل جميع العمليات على جميع العمال بتلك الخدمة عبر gRPC. في الممارسة العملية، وجدنا أن تشغيل عملية شبكة رئيسية واحدة غير موثوق به على قرون وحدة معالجة TensorFlow مع آلاف الشرائح بسبب عدد الاتصالات الواردة إلى العامل 0. يمكن أن يتسبب تعطل عملية عميل واحدة في حدوث فشل وإجبار عبء العمل بأكمله على إعادة التشغيل.
+
+لذلك، قمنا بإعادة تنفيذ `xm.rendezvous` باستخدام الاتصال الجماعي الأصلي لـ XLA، وهو أكثر استقرارًا واختبارًا جيدًا على قرون وحدة معالجة TensorFlow الكبيرة. يفرض هذا قيدين جديدين مقارنة بتنفيذ XRT:
+
+*   نظرًا لأنه يجب أن تصبح الحمولة جزءًا من رسم XLA، يتم استدعاء `xm.mark_step` قبل نقل البيانات وبعدها. يؤدي استدعاء `xm.rendezvous` في منتصف كود النموذج إلى إجبار تجميع غير مرغوب فيه.
+    
+*   نظرًا لأن XLA لا تسمح بتشغيل العمليات الجماعية على مجموعة فرعية من العمال، يجب على جميع العمال المشاركة في `rendezvous`.
+    
+
+إذا كنت بحاجة إلى السلوك القديم لـ `xm.rendezvous` (أي نقل البيانات دون تغيير رسم XLA و/أو مزامنة مجموعة فرعية من العمال)، ففكر في استخدام \`\`torch.distributed.barrier\` <[https://pytorch.org/docs/stable/distributed.html#torch.distributed.barrier](https://pytorch.org/docs/stable/distributed.html#torch.distributed.barrier)\>\`\_ أو \`\`torch.distributed.all\_gather\_object\` <[https://pytorch.org/docs/stable/distributed.html#torch.distributed.all\_gather\_object](https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_gather_object)\>\`\_ مع مجموعة عمليات `gloo`. إذا كنت تستخدم أيضًا ظهر `xla` `torch.distributed`، فيمكنك استخدام `torch.new_group` لإنشاء مجموعة فرعية من `gloo`. راجع [هذا المثال](https://pytorch.org/docs/stable/distributed.html#monitored-barrier) من وثائق PyTorch. ضع في اعتبارك هذه القيود:
+
+*   `torch.distributed` غير مدعوم بالكامل على TPU v2/v3. يتم تنفيذ مجموعة فرعية فقط من العمليات مع ظهر `xla`، ومن المحتمل ألا يعمل `gloo` كما هو متوقع في سياق متعدد الخيوط.
+    
+*   في تجاربنا، لا يتم قياس `gloo` جيدًا مع آلاف شرائح وحدة معالجة TensorFlow، لذا من المتوقع أن يكون هذا البديل أقل موثوقية من استخدام `xm.rendezvous` مع PJRT على نطاق واسع.
+    
+
+### PJRT وtorch.distributed
+
+_جديد في PyTorch/XLA r2.0_
+
+عند استخدام PJRT مع `torch.distributed` و`[torch.nn.parallel.DistributedDataParallel](https://github.com/pytorch/xla/blob/master/docs/ddp.md)` نوصي بشدة باستخدام طريقة init الجديدة `xla://`، والتي تقوم تلقائيًا بالعثور على معرفات النسخ المتماثلة وحجم العالم وعنوان IP الرئيسي عن طريق الاستعلام عن وقت التشغيل. على سبيل المثال:
+
+```py
+import torch
+import torch.distributed as dist
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+from torch_xla.experimental import pjrt
+
+# Required for `xla://` init_method and `xla` backend
+import torch_xla.distributed.xla_backend
+
+def _all_gather(index: int):
+  # No need to pass in `rank` or `world_size`
+  dist.init_process_group('xla', init_method='xla://')
+
+  t = torch.tensor([index], dtype=torch.int32, device=xm.xla_device())
+  output = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
+  dist.all_gather(output, t)
+
+  xm.mark_step()
+  print(output)
+
+if __name__ == '__main__':
+  xmp.spawn(_all_gather)
+
+
+```
+
+
+ملاحظة: على الرغم من أن طريقة init `xla://` غير مطلوبة على TPU v4، إلا أنها لا تزال موصى بها. إذا كنت تستخدم `env://`، فيجب تعيين `MASTER_ADDR` إلى عنوان IP المضيف الذي يحتوي على الجهاز 0، والذي _ليس_ دائمًا العامل 0. تقوم طريقة init `xla://` بالعثور على عنوان IP هذا تلقائيًا.
+
+ملاحظة: بالنسبة لـ TPU v2/v3، لا يزال يلزم import `torch_xla.experimental.pjrt_backend`، نظرًا لأن دعم TPU v2/v3 في `torch.distributed` لا يزال تجريبيًا.
+
+لمزيد من المعلومات حول استخدام `DistributedDataParallel` على PyTorch/XLA، راجع \`\`ddp.md\` <./ddp.md>\`\_ على TPU V4. للحصول على مثال يستخدم DDP وPJRT معًا، قم بتشغيل [نص برمجي المثال التالي](https://pytorch.org/xla/release/test/test_train_mp_imagenet.py) على وحدة معالجة TensorFlow:
+
+```bash
+PJRT_DEVICE=TPU python xla/test/test_train_mp_mnist.py --ddp --pjrt_distributed --fake_data --num_epochs 1
+
+```
+
+
+أداء
+--------------------------------------------------------
+
+يُظهر TorchBench تحسينات في متوسط وقت التدريب عبر المهام باستخدام PJRT مقارنة بـ XRT، مع تحسن متوسط يزيد عن 35% على TPU v4-8. تختلف الفوائد اختلافًا كبيرًا حسب المهمة ونوع النموذج، حيث تتراوح من 0% إلى 175%. يوضح الرسم البياني التالي التفاصيل حسب المهمة:
+
+[![PJRT مقابل XRT](https://pytorch.org/xla/release/2.3/assets/torchbench_pjrt_vs_xrt.svg)](https://pytorch.org/xla/release/2.3/assets/torchbench_pjrt_vs_xla.svg)
+
+### وقت تشغيل وحدة معالجة TensorFlow الجديد
+
+_جديد في PyTorch/XLA r2.0_
+
+يقدم إصدار PyTorch/XLA r2.0 دعمًا لـ [واجهة برمجة تطبيقات PJRT Plugin](https://github.com/openxla/community/blob/main/rfcs/20230123-pjrt-plugin.md#rfc-openxla-pjrt-plugin)، المستخدم للوصول إلى وقت تشغيل وحدة معالجة TensorFlow الجديد القائم على TFRT في `libtpu`. هذا هو وقت التشغيل الافتراضي الآن عندما يتم تعيين `PJRT_DEVICE=TPU`. سيظل وقت تشغيل وحدة معالجة TensorFlow القديم القائم على StreamExecutor المستخدم في 1.13 متاحًا باستخدام `PJRT_DEVICE=TPU_LEGACY` في الإصدار 2.0، ولكنه سيتم إزالته في إصدار مستقبلي. إذا صادفت مشكلة تحدث فقط على `TPU` وليس على `TPU_LEGACY`، يرجى تقديم مشكلة على GitHub.
+في معظم الحالات، نتوقع أن يكون الأداء مماثلاً بين وقتَي التشغيل، ولكن في بعض الحالات، قد يكون وقت التشغيل الجديد أسرع بنسبة تصل إلى 30%. يوضح الرسم البياني التالي التفاصيل حسب المهمة:
+
+[![TFRT مقابل StreamExecutor](https://pytorch.org/xla/release/2.3/assets/torchbench_tfrt_vs_se.svg)](https://pytorch.org/xla/release/2.3/assets/torchbench_tfrt_vs_se.svg)
+
+ملاحظة: تشتمل التحسينات الموضحة في هذا الرسم البياني أيضًا على مقارنة PJRT مقابل XRT.
+
+تكامل TorchDynamo (torch.compile) في PyTorch XLA
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+[TorchDynamo](https://pytorch.org/docs/stable/torch.compiler.html) عبارة عن مترجم JIT على مستوى Python مصمم لجعل برامج PyTorch غير المعدلة أسرع. يوفر واجهة برمجة تطبيقات نظيفة لخلفيات المترجم للربط بها وميزته الأكبر هي تعديل بايت كود Python ديناميكيًا مباشرة قبل تنفيذه. في إصدار pytorch/xla 2.0، قدم PyTorch/XLA خلفية تجريبية لـ TorchDynamo لكل من الاستدلال والتدريب.
+
+تتمثل طريقة عمل جسر XLA في أن Dynamo سيوفر رسمًا بيانيًا لـ TorchFX عندما يتعرف على نمط نموذج وسيستخدم PyTorch/XLA تقنية Tensor الكسول الحالية لتجميع الرسم البياني FX وإرجاع الوظيفة المجمعة.
+
+### التكامل
+
+يتم دعم PyTorch/XLA وDynamo حاليًا عن طريق إضافة وسيطة `backend='openxla'` إلى `torch.compile`. على سبيل المثال:
+
+```py
+import torch
+import torch_xla.core.xla_model as xm
+
+def add(a، b):
+  a_xla = a.to(xm.xla_device())
+  b_xla = b.to(xm.xla_device())
+  return a_xla + b_xla
+
+compiled_code = torch.compile(add، backend='openxla')
+print(compiled_code(torch.randn(10)، torch.randn(10)))
+
+```
+
+
+### الاستدلال
+
+فيما يلي مثال صغير على تشغيل resnet18 باستخدام `torch.compile`
+
+```py
+import torch
+import torchvision
+import torch_xla.core.xla_model as xm
+
+def eval_model(loader):
+  device = xm.xla_device()
+  xla_resnet18 = torchvision.models.resnet18().to(device)
+  xla_resnet18.eval()
+  dynamo_resnet18 = torch.compile(
+    xla_resnet18, backend='openxla')
+  for data, _ in loader:
+    with torch.no_grad():
+      output = dynamo_resnet18(data)
+
+```
+
+
+مع `torch.compile`، سترى أن PyTorch/XLA يقوم فقط بتعقب نموذج resnet18 مرة واحدة أثناء وقت التهيئة وتنفيذ الوظيفة المجمعة في كل مرة يتم فيها استدعاء `dynamo_resnet18`، بدلاً من تعقب النموذج في كل مرة. فيما يلي تحليل سرعة الاستدلال لمقارنة Dynamo وLazy باستخدام مقعد torch على Cloud TPU v4-8
+
+resnet18 | 2.59 resnet50 | 2.64 resnext50_32x4d | 1.91 alexnet | 1.28 mobilenet_v2 | 18.62 mnasnet1_0 | 2.68 vgg16 | 1.33 BERT_pytorch | 7.49 squeezenet1_1 | 2.29 timm_vision_transformer | 3.52 geomean | 3.04
+
+### التدريب
+
+يدعم PyTorch/XLA أيضًا Dynamo للتدريب، ولكنه تجريبي ونحن نعمل مع فريق المترجم PyTorch لتحسين التنفيذ. فيما يلي مثال على تدريب resnet18 باستخدام `torch.compile`
+
+```py
+import torch
+import torchvision
+import torch_xla.core.xla_model as xm
+
+def train_model(model, data, target, optimizer):
+  loss_fn = torch.nn.CrossEntropyLoss()
+  pred = model(data)
+  loss = loss_fn(pred, target)
+  loss.backward()
+  optimizer.step()
+  return pred
+
+def train_model_main(loader):
+  device = xm.xla_device()
+  xla_resnet18 = torchvision.models.resnet18().to(device)
+  xla_resnet18.train()
+  dynamo_train_model = torch.compile(
+        train_model, backend='openxla')
+  for data, target in loader:
+    xla_optimizer = optim.SGD(data, lr=0.1, weight_decay=1e-2)
+    output = dynamo_train_model(xla_resnet18, data, target, xla_optimizer)
+
+```
+
+
+نتوقع استخراج وتنفيذ 3 رسوم بيانية لكل خطوة تدريب بدلاً من رسم بياني واحد لكل خطوة تدريب إذا كنت تستخدم Tensor الكسول. فيما يلي تحليل سرعة التدريب لمقارنة Dynamo وLazy باستخدام مقعد torch على Cloud TPU v4-8.
+
+resnet50 | 1.33 resnet18 | 1.33 BERT_pytorch | 3.07 resnext50_32x4d | 1.43 alexnet | 1.12 mobilenet_v2 | 1.4 mnasnet1_0 | 1.19 vgg16 | 0.81 timm_vision_transformer | 1.87 squeezenet1_1 | 1.41 geomean | 1.41
+
+> **ملاحظة:** نقوم بتشغيل fwd وbwd لكل نموذج لخطوة واحدة ثم نجمع وقت e2e. في العالم الحقيقي، سنقوم بتشغيل خطوات متعددة في كل مهمة تدريب يمكن أن تخفي بسهولة تكلفة التعقب من التنفيذ (نظرًا لأنه غير متزامر). سيكون Tensor الكسول أفضل بكثير في ذلك السيناريو.
+
+### فجوات الميزة
+
+هناك فجوة واحدة نريد أن نلفت الانتباه إليها تمنعنا من استخدام TorchDynamo على نماذج أكبر.
+
+1.  سيقوم TorchDynamo بتعقب الخط الأمامي والخلفي في رسوم بيانية منفصلة. بالنسبة لـ PyTorch/XLA، من المهم أن يرى المترجم XLA الخطوة بأكملها كرسم بياني واحد لتحقيق أفضل سرعة. هناك أيضًا نفقات عامة ثابتة لإطلاق كل تنفيذ جهاز مما يجعل تنفيذ العديد من الرسوم البيانية لكل خطوة تدريب أقل مثالية.
+    
+
+تجعل هذه الفجوة مقارنة بـ Tensor الكسول أقل كفاءة في حالات الاستخدام الفعلية للتدريب، خاصة أن تكلفة التعقب يمكن أن تتداخل مع التنفيذ في التدريب.
+
+
+### الخلاصة
+
+يوفر TorchDynamo طريقة واعدة حقًا لمؤخرة المترجم لإخفاء التعقيد عن المستخدم واسترداد كود النمذجة بسهولة بتنسيق رسم بياني. مقارنةً بالطريقة التقليدية لـ PyTorch/XLA لاستخراج الرسم البياني باستخدام Tensor الكسول، يمكن لـ TorchDynamo تlinear تتبع الرسم البياني لكل تكرار، وبالتالي توفير وقت استجابة استدلال أفضل بكثير.
+
+شهدت معظم النماذج التي يدعمها PyTorch/XLA تسريعًا كبيرًا عند تشغيل الاستدلال باستخدام جسر dynamo-xla الجديد. ويعمل مجتمعنا بجد لتوسيع مجموعة النماذج المدعومة. فيما يتعلق بالفجوات في ميزات التدريب المذكورة أعلاه، فإن مجتمع PyTorch/XLA متحمس للغاية لتحسين فجوة التدريب في عمل التطوير القادم لدينا. يواصل الفريق الاستثمار بكثافة في TorchDynamo والعمل مع المصدر العلوي لتحسين قصة التدريب.
+
+Fully Sharded Data Parallel (FSDP) في PyTorch XLA
+----------------------------------------------------------------------------------------------------------------------------------
+
+Fully Sharded Data Parallel (FSDP) في PyTorch XLA هي أداة لتجزئة معلمات الوحدة عبر العمال المتوازيين للبيانات.
+
+مثال الاستخدام:
+
+```py
+import torch
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as FSDP
+
+model = FSDP(my_module)
+optim = torch.optim.Adam(model.parameters(), lr=0.0001)
+output = model(x, y)
+loss = output.sum()
+loss.backward()
+optim.step()
+
+```
+
+
+من الممكن أيضًا تجزئة الطبقات الفردية بشكل منفصل وإحاطة أي معلمات متبقية بمغلف خارجي.
+
+ملاحظات:
+
+*   تدعم فئة `XlaFullyShardedDataParallel` كلًا من محسن ZeRO-2 (تجزئة التدرجات وحالات المحسن) ومحسن ZeRO-3 (تجزئة المعلمات والتدرجات وحالات المحسن) في [https://arxiv.org/abs/1910.02054](https://arxiv.org/abs/1910.02054).
+    
+    *   يجب تنفيذ محسن ZeRO-3 عبر FSDP متداخلة مع `reshard_after_forward=True`. راجع `test/test_train_mp_mnist_fsdp_with_ckpt.py` و`test/test_train_mp_imagenet_fsdp.py` للحصول على مثال.
+        
+    *   بالنسبة للنماذج الكبيرة التي لا يمكن أن تتسع لذاكرة TPU واحدة أو ذاكرة وحدة المعالجة المركزية المضيفة، يجب أن يتداخل بناء الوحدة الفرعية مع التفاف FSDP الداخلي. راجع \`\`FSDPViTModel\` <[https://github.com/ronghanghu/vit\_10b\_fsdp\_example/blob/master/run\_vit\_training.py](https://github.com/ronghanghu/vit_10b_fsdp_example/blob/master/run_vit_training.py)\>\`\_ للحصول على مثال.
+        
+*   تم توفير غلاف بسيط `checkpoint_module` (بناءً على `torch_xla.utils.checkpoint.checkpoint` من [https://github.com/pytorch/xla/pull/3524](https://github.com/pytorch/xla/pull/3524)) لأداء [فحص التدرج](https://spell.ml/blog/gradient-checkpointing-pytorch-YGypLBAAACEAefHs) عبر مثيل `nn.Module` معين. راجع `test/test_train_mp_mnist_fsdp_with_ckpt.py` و`test/test_train_mp_imagenet_fsdp.py` للحصول على مثال.
+    
+*   التغليف التلقائي للوحدات الفرعية: بدلاً من التفاف FSDP المتداخل يدويًا، يمكنك أيضًا تحديد حجة `auto_wrap_policy` لالتفاف الوحدات الفرعية تلقائيًا باستخدام FSDP الداخلي. `size_based_auto_wrap_policy` في `torch_xla.distributed.fsdp.wrap` هو مثال على `auto_wrap_policy` قابل للاستدعاء، ويغلف هذه السياسة الطبقات التي تحتوي على عدد من المعلمات أكبر من 100 مليون. `transformer_auto_wrap_policy` في `torch_xla.distributed.fsdp.wrap` هو مثال على `auto_wrap_policy` قابل للاستدعاء لهندسات النماذج الشبيهة بالمحول.
+    
+
+على سبيل المثال، لالتفاف جميع الوحدات الفرعية `torch.nn.Conv2d` تلقائيًا باستخدام FSDP الداخلي، يمكنك استخدام ما يلي:
+
+```py
+from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={torch.nn.Conv2d})
+
+```
+
+
+بالإضافة إلى ذلك، يمكنك أيضًا تحديد حجة `auto_wrapper_callable` لاستخدام وظيفة استدعاء مخصصة للالتفاف على الوحدات الفرعية (يكون الغلاف الافتراضي هو فئة `XlaFullyShardedDataParallel` نفسها). على سبيل المثال، يمكنك استخدام ما يلي لتطبيق فحص التدرج (أي فحص/إعادة إنشاء التنشيط) على كل وحدة فرعية ملفوفة تلقائيًا.
+
+```py
+from torch_xla.distributed.fsdp import checkpoint_module
+auto_wrapper_callable = lambda m, *args, **kwargs: XlaFullyShardedDataParallel(
+    checkpoint_module(m), *args, **kwargs)
+
+```
+
+
+*   عند إجراء خطوة للمحسن، اتصل مباشرة بـ `optimizer.step` ولا تتصل بـ `xm.optimizer_step`. يقوم الأخير بتخفيض التدرج عبر الرتب، وهو غير مطلوب لـ FSDP (حيث تكون المعلمات مجزأة بالفعل).
+    
+*   عند حفظ نقاط تفتيش النموذج والمحسن أثناء التدريب، يجب على كل عملية تدريب حفظ نقطة تفتيش خاصة بها من القواميس (المجزأة) لحالة النموذج والمحسن (استخدم `master_only=False` وقم بتعيين مسارات مختلفة لكل رتبة في `xm.save`). عند الاستئناف، يلزم تحميل نقطة تفتيش للرتبة المقابلة.
+    
+*   يرجى أيضًا حفظ `model.get_shard_metadata()` إلى جانب `model.state_dict()` كما هو موضح أدناه واستخدم `consolidate_sharded_model_checkpoints` لربط نقاط تفتيش النموذج المجزأة معًا في قاموس حالة النموذج الكامل. راجع `test/test_train_mp_mnist_fsdp_with_ckpt.py` للحصول على مثال. .. 
+
+```py
+    
+    > ckpt = {
+    > 
+    > 'model': model.state\_dict(), 'shard\_metadata': model.get\_shard\_metadata(), 'optimizer': optimizer.state\_dict(),
+    > 
+    > } ckpt\_path = f'/tmp/rank-{xm.get\_ordinal()}-of-{xm.xrt\_world\_size()}.pth' xm.save(ckpt, ckpt\_path, master\_only=False)
+    
+    ```
+    
+*   يمكن أيضًا تشغيل برنامج توحيد نقاط التفتيش من سطر الأوامر كما هو موضح أدناه. .. 
+
+```bash
+    
+    > \# توحيد نقاط التفتيش المحفوظة عبر أداة سطر الأوامر 
+    > python3 -m torch\_xla.distributed.fsdp.consolidate\_sharded\_ckpts –ckpt\_prefix /path/to/your\_sharded\_checkpoint\_files –ckpt\_suffix "\_rank-_\-of-_."
+``` 
+
+يستلهم تنفيذ هذه الفئة إلى حد كبير من هيكل `fairscale.nn.FullyShardedDataParallel` في [https://fairscale.readthedocs.io/en/stable/api/nn/fsdp.html](https://fairscale.readthedocs.io/en/stable/api/nn/fsdp.html) ويتبعه إلى حد كبير. أحد أكبر الاختلافات عن `fairscale.nn.FullyShardedDataParallel` هو أنه في XLA، لا توجد لدينا مساحة تخزين معلمات صريحة، لذا فإننا نلجأ هنا إلى نهج مختلف لتحرير المعلمات الكاملة لـ ZeRO-3.
+
+* * *
+
+### مثال على البرامج النصية للتدريب على MNIST وImageNet
+
+*   MNIST: \`\`test/test\_train\_mp\_mnist\_fsdp\_with\_ckpt.py\` <[https://github.com/pytorch/xla/blob/master/test/test\_train\_mp\_mnist\_fsdp\_with\_ckpt.py](https://github.com/pytorch/xla/blob/master/test/test_train_mp_mnist_fsdp_with_ckpt.py)\>\`\_ (يختبر أيضًا توحيد نقاط التفتيش)
+    
+*   ImageNet: \`\`test/test\_train\_mp\_imagenet\_fsdp.py\` <[https://github.com/pytorch/xla/blob/master/test/test\_train\_mp\_imagenet\_fsdp.py](https://github.com/pytorch/xla/blob/master/test/test_train_mp_imagenet_fsdp.py)\>\`\_
+    
+
+#### استنساخ مستودع PyTorch/XLA
+
+```bash
+git clone --recursive https://github.com/pytorch/pytorch
+cd pytorch/
+git clone --recursive https://github.com/pytorch/xla.git
+cd ~/
+
+```
+
+
+#### تدريب MNIST على v3-8 TPU
+
+يحصل على دقة تبلغ حوالي 98.9 لدورتين:
+
+```bash
+python3 ~/pytorch/xla/test/test_train_mp_mnist_fsdp_with_ckpt.py \
+  --batch_size 16 --drop_last --num_epochs 2 \
+  --use_nested_fsdp --use_gradient_checkpointing
+
+```
+
+
+يختبر هذا البرنامج النصي تلقائيًا توحيد نقاط التفتيش في النهاية. يمكنك أيضًا توحيد نقاط التفتيش المجزأة يدويًا عبر
+
+```bash
+# توحيد نقاط التفتيش المحفوظة عبر أداة سطر الأوامر
+python3 -m torch_xla.distributed.fsdp.consolidate_sharded_ckpts \
+  --ckpt_prefix /tmp/mnist-fsdp/final_ckpt \
+  --ckpt_suffix "_rank-*-of-*.pth"
+
+```
+
+
+#### تدريب ImageNet باستخدام ResNet-50 على v3-8 TPU
+
+يحصل على دقة تبلغ حوالي 75.9 لـ 100 دورة تدريب؛ قم بتنزيل [ImageNet-1k](https://github.com/pytorch/examples/tree/master/imagenet#requirements) إلى `/datasets/imagenet-1k`:
+
+```bash
+python3 ~/pytorch/xla/test/test_train_mp_imagenet_fsdp.py \
+  --datadir /datasets/imagenet-1k --drop_last \
+  --model resnet50 --test_set_batch_size 64 --eval_interval 10 \
+  --lr 0.4 --batch_size 128 --num_warmup_epochs 5 --lr_scheduler_divide_every_n_epochs 30 --lr_scheduler_divisor 10 --num_epochs 100 \
+  --use_nested_fsdp
+
+```
+
+
+يمكنك أيضًا إضافة `--use_gradient_checkpointing` (يجب استخدامه مع `--use_nested_fsdp` أو `--auto_wrap_policy`) لتطبيق فحص التدرج على الكتل المتبقية.
+
+* * *
+
+### مثال على البرامج النصية للتدريب على TPU pod (مع 10 مليارات معلمة)
+
+لتدريب النماذج الكبيرة التي لا يمكن أن تتسع لذاكرة TPU واحدة، يجب تطبيق التفاف تلقائي أو التفاف يدوي للوحدات الفرعية باستخدام FSDP الداخلي عند بناء النموذج بالكامل لتنفيذ خوارزمية ZeRO-3.
+
+يرجى الاطلاع على [https://github.com/ronghanghu/vit\_10b\_fsdp\_example](https://github.com/ronghanghu/vit_10b_fsdp_example) للحصول على مثال على التدريب المجزأ لنموذج محول الرؤية (ViT) باستخدام طلب سحب FSDP XLA هذا.
+
+كيفية إجراء `DistributedDataParallel`
+------------------------------------------------------------------------------------------------------
+
+توضح هذه الوثيقة كيفية استخدام torch.nn.parallel.DistributedDataParallel في xla، وتصف كذلك اختلافه عن نهج xla الموازي للبيانات الأصلي.
+
+الخلفية / الدافع
+------------------------------------------------------------------------------
+
+طلب العملاء منذ فترة طويلة القدرة على استخدام واجهة برمجة تطبيقات DistributedDataParallel الخاصة بـ PyTorch مع xla. وهنا نقوم بتمكينها كميزة تجريبية.
+
+كيفية استخدام DistributedDataParallel
+------------------------------------------------------------------------------------------------------
+
+بالنسبة لأولئك الذين انتقلوا من وضع PyTorch Eager إلى XLA، فيما يلي جميع التغييرات التي يلزم إجراؤها لتحويل نموذج DDP Eager إلى نموذج XLA. نفترض أنك تعرف بالفعل كيفية استخدام XLA [على جهاز واحد](https://pytorch.org/xla/release/API_GUIDE.md#running-on-a-single-xla-device).
+
+1. استورد الحزم الموزعة المحددة لـ XLA:
+    
+
+```py
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_backend
+
+```
+
+
+1. قم بتهيئة مجموعة العمليات الخاصة بـ XLA على غرار مجموعات العمليات الأخرى مثل nccl وgloo.
+    
+
+```py
+dist.init_process_group("xla", rank=rank, world_size=world_size)
+
+```
+
+
+1. استخدم واجهات برمجة التطبيقات المحددة لـ XLA للحصول على الرتبة وحجم العالم إذا كنت بحاجة إلى ذلك.
+    
+
+```py
+new_rank = xm.get_ordinal()
+world_size = xm.xrt_world_size()
+
+```
+
+
+1. قم بتمرير `gradient_as_bucket_view=True` إلى غلاف DDP.
+    
+
+```py
+ddp_model = DDP(model, gradient_as_bucket_view=True)
+
+```
+
+
+1. أخيرًا، قم بتشغيل نموذجك باستخدام برنامج التشغيل المحدد لـ XLA.
+    
+
+لقد جمعنا كل شيء هنا (المثال مأخوذ بالفعل من [برنامج تعليمي حول DDP](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)). الطريقة التي تقوم بترميزها مشابهة جدًا لتجربة Eager. فقط مع لمسات XLA المحددة على جهاز واحد بالإضافة إلى التغييرات الخمسة أعلاه في البرنامج النصي الخاص بك.
+
+```py
+import os
+import sys
+import tempfile
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# additional imports for xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_backend
+import torch_xla.distributed.xla_multiprocessing as xmp
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the xla process group
+    dist.init_process_group("xla", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+class ToyModel(nn.Module):
+    def __init__(self):
+        super(ToyModel, self).__init__()
+        self.net1 = nn.Linear(10, 1000000)
+        self.relu = nn.ReLU()
+        self.net2 = nn.Linear(1000000, 5)
+
+    def forward(self, x):
+        return self.net2(self.relu(self.net1(x)))
+
+def demo_basic(rank):
+    # xla specific APIs to get rank, world_size.
+    new_rank = xm.get_ordinal()
+    assert new_rank == rank
+    world_size = xm.xrt_world_size()
+
+    print(f"Running basic DDP example on rank {rank}.")
+    setup(rank, world_size)
+
+    # create model and move it to XLA device
+    device = xm.xla_device()
+    model = ToyModel().to(device)
+    # currently, graident_as_bucket_view is needed to make DDP work for xla
+    ddp_model = DDP(model, gradient_as_bucket_view=True)
+
+    loss_fn = nn.MSELoss()
+    optimizer = optim.SGD(ddp_model.parameters(), lr=0.001)
+
+    optimizer.zero_grad()
+    outputs = ddp_model(torch.randn(20, 10).to(device))
+    labels = torch.randn(20, 5).to(device)
+    loss_fn(outputs, labels).backward()
+    optimizer.step()
+    # xla specific API to execute the graph
+    xm.mark_step()
+
+    cleanup()
+
+
+def run_demo(demo_fn):
+    # xla specific launcher
+    xmp.spawn(demo_fn)
+
+if __name__ == "__main__":
+    run_demo(demo_basic)
+
+```
+
+
+المعايير
+----------------------------------------------------------
+
+### Resnet50 مع بيانات وهمية
+
+تم جمع النتائج التالية باستخدام الأمر: `python test/test_train_mp_imagenet.py --fake_data --model=resnet50 --num_epochs=1` في بيئة TPU VM V3-8 مع PyTorch وPyTorch/XLA ToT. وتم إنتاج المقاييس الإحصائية باستخدام البرنامج النصي في طلب السحب هذا [طلب السحب](https://github.com/pytorch/xla/pull/4107). وحدة المعدل هي الصور في الثانية.
+
+
+| النوع                | المتوسط   | الوسيط   | 90%      | الانحراف المعياري | CV     |
+|--------------------|---------|---------|---------|----------|-------|
+| xm.optimizer_step   | 418.54   | 419.22   | 430.40   | 9.76      | 0.02   |
+| DDP                 | 395.97   | 395.54   | 407.13   | 7.60      | 0.02   |
+
+
+يبلغ الفرق في الأداء بين نهجنا الأصلي للتوازي الموزع للبيانات وغِلاف DistributedDataParallel هو: 1 - 395.97 / 418.54 = 5.39%. تبدو هذه النتيجة معقولة بالنظر إلى أن غلاف DDP يقدم نفقات عامة إضافية لتتبع وقت تشغيل DDP.
+
+### MNIST مع بيانات وهمية
+
+تم جمع النتائج التالية باستخدام الأمر: `python test/test_train_mp_mnist.py --fake_data` في بيئة TPU VM V3-8 مع PyTorch وPyTorch/XLA ToT. وتم إنتاج المقاييس الإحصائية باستخدام البرنامج النصي في طلب السحب هذا [طلب السحب](https://github.com/pytorch/xla/pull/4107). وحدة المعدل هي الصور في الثانية.
+
+
+| النوع                | المتوسط   | الوسيط     | 90%     | الانحراف المعياري | CV     |
+|--------------------|-----------|-----------|-----------|----------|-------|
+| xm.optimizer_step   | 17864.19   | 20108.96   | 24351.74   | 5866.83   | 0.33   |
+| DDP                 | 10701.39   | 11770.00   | 14313.78   | 3102.92   | 0.29   |
+
+
+يبلغ الفرق في الأداء بين نهجنا الأصلي للتوازي الموزع للبيانات وغِلاف DistributedDataParallel هو: 1 - 14313.78 / 24351.74 = 41.22%. هنا نقارن 90% بدلاً من ذلك نظرًا لأن مجموعة البيانات صغيرة وتتأثر الجولات القليلة الأولى بشدة بتحميل البيانات. هذا التباطؤ هائل ولكنه منطقي بالنظر إلى أن النموذج صغير. من الصعب استهلاك النفقات العامة الإضافية لتتبع وقت تشغيل DDP.
+
+### MNIST مع بيانات حقيقية
+
+تم جمع النتائج التالية باستخدام الأمر: `python test/test_train_mp_mnist.py --logdir mnist/` في بيئة TPU VM V3-8 مع PyTorch وPyTorch/XLA ToT.
+
+[![learning_curves](https://pytorch.org/xla/release/2.3/assets/ddp_md_mnist_with_real_data.png)](https://pytorch.org/xla/release/2.3/assets/ddp_md_mnist_with_real_data.png)
+
+ويمكننا أن نلاحظ أن غلاف DDP يتقارب بشكل أبطأ من النهج الأصلي لـ XLA على الرغم من أنه لا يزال يحقق معدل دقة مرتفع عند 97.48% في النهاية. (يحقق النهج الأصلي 99%.)
+
+إخلاء المسؤولية
+------------------------------------------------------
+
+هذه الميزة لا تزال تجريبية وتحت التطوير النشط. استخدمها بحذر ولا تتردد في إرسال أي أخطاء إلى [مستودع github xla](https://github.com/pytorch/xla/). بالنسبة لأولئك الذين يهتمون بالنهج الأصلي للتوازي الموزع للبيانات لـ XLA، إليك [البرنامج التعليمي](https://pytorch.org/xla/release/API_GUIDE.md#running-on-multiple-xla-devices-with-multi-processing).
+
+فيما يلي بعض المشكلات المعروفة التي يجري التحقيق فيها:
+
+*   يجب تطبيق `gradient_as_bucket_view=True`.
+    
+*   هناك بعض المشكلات أثناء استخدامها مع `torch.utils.data.DataLoader`. `​​test_train_mp_mnist.py` مع البيانات الحقيقية تتحطم قبل الخروج.
+    
+
+كيفية التشغيل مع PyTorch/XLA: GPU
+------------------------------------------------------------------------------------------------
+
+تمكّن PyTorch/XLA مستخدمي PyTorch من الاستفادة من مترجم XLA الذي يدعم المعجلات بما في ذلك TPU وGPU وCPU. ستتناول هذه الوثيقة الخطوات الأساسية لتشغيل PyTorch/XLA على مثيلات GPU من Nvidia.
+
+إنشاء مثيل GPU
+----------------------------------------------------------------------------
+
+يمكنك إما استخدام جهاز محلي بجهاز GPU متصل أو آلة افتراضية GPU في السحابة. على سبيل المثال، في Google Cloud، يمكنك اتباع هذه [الوثيقة](https://cloud.google.com/compute/docs/gpus/create-vm-with-gpus) لإنشاء آلة افتراضية GPU.
+
+إعداد البيئة
+--------------------------------------------------------------------
+
+### Docker
+
+ينشر PyTorch/XLA حاليًا صور Docker وعجلات مسبقة البناء مع cuda11.7/8 وPython 3.8. نوصي المستخدمين بإنشاء حاوية Docker مع التكوين المقابل. للحصول على قائمة كاملة بصور Docker والعجلات، يرجى الرجوع إلى [هذه الوثيقة](https://github.com/pytorch/xla#available-docker-images-and-wheels).
+
+```bash
+sudo docker pull us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.8_cuda_12.1
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent    software-properties-common
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+sudo docker run --shm-size=16g --net=host --gpus all -it -d us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.8_cuda_12.1 bin/bash
+sudo docker exec -it $(sudo docker ps | awk 'NR==2 { print $1 }') /bin/bash
+
+```
+
+
+يرجى ملاحظة أنه يلزم إعادة تشغيل برنامج Docker لجعل أجهزة GPU مرئية في حاوية Docker. بعد تسجيل الدخول إلى Docker، يمكنك استخدام `nvidia-smi` للتحقق من إعداد الجهاز بشكل صحيح.
+
+```bash
+(pytorch) root@20ab2c7a2d06:/# nvidia-smi
+Thu Dec  8 06:24:29 2022
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 510.47.03    Driver Version: 510.47.03    CUDA Version: 11.6     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|                               |                      |               MIG M. |
+|===============================+======================+======================|
+|   0  Tesla V100-SXM2...  Off  | 00000000:00:04.0 Off |                    0 |
+| N/A   36C    P0    38W / 300W |      0MiB / 16384MiB |      1%      Default |
+|                               |                      |                  N/A |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|  No running processes found                                                 |
++-----------------------------------------------------------------------------+
+
+```
+
+
+### تحقق من متغير البيئة
+
+تأكد من أن متغيرات البيئة PATH وLD_LIBRARY_PATH تحسب لـ cuda. يرجى إجراء `echo $PATH` و`echo $LD_LIBRARY_PATH` للتحقق. إذا لم يكن الأمر كذلك، يرجى اتباع [الرابط](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#mandatory-actions) للقيام بذلك. مثال:
+
+```bash
+echo "export PATH=/usr/local/cuda-12.1/bin${PATH:+:${PATH}}" >> ~/.bashrc
+echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> ~/.bashrc
+source ~/.bashrc
+
+```
+
+
+### العجلة Wheel
+
+```bash
+pip3 install torch==2.2.0
+pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/cuda/12.1/torch_xla-2.2.0-cp38-cp38-manylinux_2_28_x86_64.whl
+
+```
+
+تشغيل نموذج بسيط
+----------------------------------------------------------------------
+
+لتشغيل الأمثلة أدناه، تحتاج إلى استنساخ مستودع pytorch/xla للوصول إلى مثال imagenet (لقد قمنا بالفعل باستنساخه في Docker الخاص بنا).
+
+```bash
+(pytorch) root@20ab2c7a2d06:/# export GPU_NUM_DEVICES=1 PJRT_DEVICE=CUDA
+(pytorch) root@20ab2c7a2d06:/# git clone --recursive https://github.com/pytorch/xla.git
+(pytorch) root@20ab2c7a2d06:/# python xla/test/test_train_mp_imagenet.py --fake_data
+==> إعداد البيانات..
+حقبة 1 التدريب تبدأ 06:12:38
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=0 خسارة=6.89059 المعدل=2.82 المعدل العالمي=2.82 الوقت=06:13:23
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=20 خسارة=6.79297 المعدل=117.16 المعدل العالمي=45.84 الوقت=06:13:36
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=40 خسارة=6.43628 المعدل=281.16 المعدل العالمي=80.49 الوقت=06:13:43
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=60 خسارة=5.83108 المعدل=346.88 المعدل العالمي=108.82 الوقت=06:13:49
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=80 خسارة=4.99023 المعدل=373.62 المعدل العالمي=132.43 الوقت=06:13:56
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=100 خسارة=3.92699 المعدل=384.33 المعدل العالمي=152.40 الوقت=06:14:02
+| جهاز التدريب=xla:0/0 حقبة=1 خطوة=120 خسارة=2.68816 المعدل=388.35 المعدل العالمي=169.49 الوقت=06:14:09
+
+```
+
+
+AMP (الدقة المختلطة التلقائية)
+----------------------------------------------------------------------------------------------
+
+تعد AMP مفيدة جدًا في التدريب على GPU ويعيد PyTorch/XLA استخدام قاعدة Amp الخاصة بـ Cuda. يمكنك الاطلاع على مثالنا [mnist](https://github.com/pytorch/xla/blob/master/test/test_train_mp_mnist_amp.py) و[imagenet](https://github.com/pytorch/xla/blob/master/test/test_train_mp_imagenet_amp.py). لاحظ أننا استخدمنا أيضًا إصدارًا معدلاً من [المحسنات](https://github.com/pytorch/xla/tree/master/torch_xla/amp/syncfree) لتجنب المزامنة الإضافية بين الجهاز والمضيف.
+
+تطوير PyTorch/XLA على مثيل GPU (بناء PyTorch/XLA من المصدر مع دعم GPU)
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+1. داخل آلة افتراضية GPU، قم بإنشاء حاوية Docker من صورة Docker للتطوير. على سبيل المثال:
+    
+
+```bash
+sudo docker pull us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:3.8_cuda_12.1
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent    software-properties-common
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+sudo docker run --shm-size=16g --net=host --gpus all -it -d us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:3.8_cuda_12.1
+sudo docker exec -it $(sudo docker ps | awk 'NR==2 { print $1 }') /bin/bash
+
+```
+
+
+1. قم ببناء PyTorch وPyTorch/XLA من المصدر.
+    
+
+تأكد من أن متغيرات البيئة PATH وLD_LIBRARY_PATH تحسب لـ cuda. راجع [ما سبق](https://github.com/pytorch/xla/blob/master/docs/gpu.md#check-environment-variable) للحصول على مزيد من المعلومات.
+
+```bash
+git clone https://github.com/pytorch/pytorch.git
+cd pytorch
+USE_CUDA=1 python setup.py install
+
+git clone https://github.com/pytorch/xla.git
+cd xla
+XLA_CUDA=1 python setup.py install
+
+```
+
+
+1. تحقق مما إذا كان PyTorch وPyTorch/XLA قد تم تثبيتهما بنجاح.
+    
+
+إذا تمكنت من تشغيل الاختبار في القسم [تشغيل نموذج بسيط](#run-a-simple-model) بنجاح، فيجب أن يكون PyTorch وPyTorch/XLA قد تم تثبيتهما بنجاح.
+
+دليل مستخدم PyTorch/XLA SPMD
+----------------------------------------------------------------------------------------
+
+في هذا الدليل، نناقش كيفية [GSPMD](https://arxiv.org/abs/2105.04663) مدمجة في PyTorch/XLA، ونقدم نظرة عامة على التصميم لتوضيح كيفية عمل واجهة برمجة التطبيقات للتشظية SPMD وبنيتها. وبعد ذلك، نقدم قائمة بأمثلة مرجعية للمستخدمين لتجربتها.
+
+ما هو PyTorch/XLA SPMD؟
+-----------------------------------------------------------------------------------
+
+[GSPMD](https://arxiv.org/abs/2105.04663) هو نظام موازاة تلقائي لأحمال العمل الشائعة في ML. سيحول مترجم XLA البرنامج أحادي الجهاز إلى برنامج مجزأ مع مجموعات الاتصالات الصحيحة، بناءً على تلميحات التشظية التي حددها المستخدم. تتيح هذه الميزة للمطورين كتابة برامج PyTorch كما لو كانت على جهاز واحد كبير دون أي عمليات حسابية مجزأة مخصصة و/أو اتصالات جماعية للتوسع.
+
+[![alt_text](https://pytorch.org/xla/release/2.3/assets/spmd_mode.png)](https://pytorch.org/xla/release/2.3/assets/spmd_mode.png)
+
+[\*](#id24)الشكل 1. مقارنة بين استراتيجيتي تنفيذ مختلفتين، (أ) لغير SPMD و(ب) لـ SPMD.\*
+
+لدعم GSPMD في PyTorch/XLA، نقدم وضع تنفيذ جديد. قبل GSPMD، افترض وضع التنفيذ في PyTorch/XLA وجود عدة نسخ من النموذج، لكل منها نواة واحدة (الشكل 1.a). يناسب وضع التنفيذ هذا، كما هو موضح أعلاه، أطر عمل التوازي للبيانات، مثل PyTorch [Distributed Data Parallel (DDP)](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html) أو Fully Sharded Data Parallel (FSDP) الشائعة، ولكنه محدود أيضًا في أن النسخة المكررة يمكن أن تقيم فقط على نواة جهاز واحدة. يقدم PyTorch/XLA SPMD وضع تنفيذ جديد يفترض وجود نسخة واحدة مع عدة نوى (الشكل 1.b)، مما يسمح للنسخة المكررة بالعمل عبر عدة نوى جهاز. يتيح هذا التحول استراتيجيات توازي أكثر تقدمًا لتحسين أداء تدريب النماذج الكبيرة.
+
+يتوفر PyTorch/XLA SPMD على وقت تشغيل [PJRT](https://github.com/pytorch/xla/blob/master/docs/pjrt.md) الجديد. لتمكين وضع تنفيذ PyTorch/XLA SPMD، يجب على المستخدم استدعاء واجهة برمجة التطبيقات [use_spmd()](https://github.com/pytorch/xla/blob/b8b484515a97f74e013dcf38125c44d53a41f011/torch_xla/runtime.py#L214).
+
+```py
+import torch_xla.runtime as xr
+
+# Enable PyTorch/XLA SPMD execution mode.
+xr.use_spmd()
+assert xr.is_spmd() == True
+
+```
+
+
+من المهم ملاحظة أن SPMD هو بديل لأي آليات متوازية موجودة، بما في ذلك DDP وFSDP. لا يمكن للمستخدمين خلط وضعي تنفيذ مختلفين (SPMD وغير SPMD)، وفيما بعد في هذا الدليل، سنشرح كيفية استخدام علامة SPMD لأداء DDP وFSDP.
+
+أيضًا، تم اختبار هذه النسخة من SPMD حاليًا فقط. سيتم تحسين الدعم والتحسين على GPU في الإصدار 2.2.
+
+نظرة عامة على تصميم PyTorch/XLA SPMD
+--------------------------------------------------------------------------------------------------
+
+### مثال بسيط وواجهة برمجة تطبيقات التشظية
+
+يمكن للمستخدمين وضع علامات على تنسورات PyTorch الأصلية باستخدام واجهة برمجة التطبيقات `mark_sharding` ([src](https://github.com/pytorch/xla/blob/4e8e5511555073ce8b6d1a436bf808c9333dcac6/torch_xla/distributed/spmd/xla_sharding.py#L452)). يأخذ هذا `torch.Tensor` كإدخال ويعيد `XLAShardedTensor` كإخراج.
+
+```bash
+def mark_sharding(t: Union[torch.Tensor, XLAShardedTensor], mesh: Mesh, partition_spec: Tuple[Union[int, None]]) -> XLAShardedTensor
+
+```
+
+
+يأخذ استدعاء واجهة برمجة التطبيقات `mark_sharding` شبكة منطقية للمستخدم [mesh](#mesh) و[partition_spec](#partition-spec) وينشئ علامة تشظية لمترجم XLA. يتم إرفاق مواصفات التشظية بـ XLATensor. إليك مثال بسيط من [RFC](https://github.com/pytorch/xla/issues/3871)، لتوضيح كيفية عمل واجهة برمجة التطبيقات لعلامة التشظية:
+
+```py
+import numpy as np
+import torch
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+import torch_xla.distributed.spmd as xs
+from torch_xla.distributed.spmd import Mesh
+
+# Enable XLA SPMD execution mode.
+xr.use_spmd()
+
+# Device mesh, this and partition spec as well as the input tensor shape define the individual shard shape.
+mesh_shape = (2, 4)
+num_devices = xr.global_runtime_device_count()
+device_ids = np.array(range(num_devices))
+mesh = Mesh(device_ids, mesh_shape, ('x', 'y'))
+
+t = torch.randn(8, 4).to(xm.xla_device())
+
+# Mesh partitioning, each device holds 1/8-th of the input
+partition_spec = (0, 1)
+m1_sharded = xs.mark_sharding(t, mesh, partition_spec)
+assert isinstance(m1_sharded, XLAShardedTensor) == True
+
+
+```
+
+
+يمكننا وضع علامات على تنسورات مختلفة في برنامج PyTorch لتمكين تقنيات التوازي المختلفة، كما هو موضح في التعليق أدناه:
+
+```py
+# Sharding annotate the linear layer weights.
+model = SimpleLinear().to(xm.xla_device())
+xs.mark_sharding(model.fc1.weight, mesh, partition_spec)
+
+# Training loop
+model.train()
+for step, (data, target) in enumerate(loader):
+  # Assumes `loader` returns data, target on XLA device
+  optimizer.zero_grad()
+  # Sharding annotate input data, we can shard any input
+  # dimensions. Sharidng the batch dimension enables
+  # in data parallelism, sharding the feature dimension enables
+  # spatial partitioning.
+  xs.mark_sharding(data, mesh, partition_spec)
+  ouput = model(data)
+  loss = loss_fn(output, target)
+  optimizer.step()
+  xm.mark_step()
+
+```
+
+
+تتوفر حالات اختبار الوحدة واختبارات التكامل الأكثر اكتمالاً في مستودع PyTorch/XLA [repo](https://github.com/pytorch/xla/tree/r2.0/test/spmd).
+
+### الشبكة
+
+بالنسبة لمجموعة معينة من الأجهزة، تكون الشبكة المادية تمثيلًا لطوبولوجيا الاتصال.
+
+نشتق شبكة منطقية بناءً على هذه الطوبولوجيا لإنشاء مجموعات فرعية من الأجهزة التي يمكن استخدامها لتقسيم محاور مختلفة من التنسورات في النموذج.
+
+[![alt_text](https://pytorch.org/xla/release/2.3/assets/mesh_spmd2.png)](https://pytorch.org/xla/release/2.3/assets/mesh_spmd2.png)
+
+نحن نلخص شبكة منطقية مع [واجهة برمجة التطبيقات Mesh](https://github.com/pytorch/xla/blob/4e8e5511555073ce8b6d1a436bf808c9333dcac6/torch_xla/distributed/spmd/xla_sharding.py#L17). يمكن تسمية محاور الشبكة المنطقية. إليك مثال:
+
+```py
+import torch_xla.runtime as xr
+from torch_xla.distributed.spmd import Mesh
+
+# Assuming you are running on a TPU host that has 8 devices attached
+num_devices = xr.global_runtime_device_count()
+# mesh shape will be (4,2) in this example
+mesh_shape = (num_devices // 2, 2)
+device_ids = np.array(range(num_devices))
+# axis_names 'x' nad 'y' are optional
+mesh = Mesh(device_ids, mesh_shape, ('x', 'y'))
+
+mesh.get_logical_mesh()
+>> array([[0, 1],
+          [2, 3],
+          [4, 5],
+          [6, 7]])
+mesh.shape()
+>> OrderedDict([('x', 4), ('y', 2)])
+
+```
+
+
+بشكل عام، يجب أن تنشئ برامج SPMD شبكة واحدة وتعيد استخدامها لجميع التشظية لضمان اتساق تعيين التبليط مع استراتيجية التشظية المقصودة. يمكن إعادة استخدام نفس الشبكة للتنسورات بأشكال وتقسيمات مختلفة عن طريق التلاعب بمواصفات التقسيم، والتي سيتم تناولها بمزيد من التفصيل أدناه.
+
+
+### شبكة هجينة
+
+تُلخص شبكة HybridMesh بشكل جميل كيفية بناء شبكة الأجهزة المادية. يمكن للمستخدمين ترتيب الأجهزة بأي شكل وترتيب باستخدام الشبكة المنطقية. ومع ذلك، يمكنك تحديد شبكة أكثر كفاءة بناءً على طوبولوجيا الشبكة، خاصة عند استخدام اتصالات شريحة Data Center Network (DCN) المتقاطعة. تقوم HybridMesh بإنشاء شبكة توفر أداءً جيدًا من الصندوق لمثل هذه البيئات متعددة الشرائح. إنه يقبل ici_mesh_shape وdcn_mesh_shape التي تشير إلى أشكال الشبكة المنطقية للأجهزة المتصلة داخليًا وخارجيًا.
+
+```py
+from torch_xla.distributed.spmd import HybridMesh
+
+# This example is assuming 2 slices of v4-8.
+# - ici_mesh_shape: shape of the logical mesh for inner connected devices.
+# - dcn_mesh_shape: shape of logical mesh for outer connected devices.
+ici_mesh_shape = (1, 4, 1) # (data, fsdp, tensor)
+dcn_mesh_shape = (2, 1, 1)
+
+mesh = HybridMesh(ici_mesh_shape, dcn_mesh_shape, ('data','fsdp','tensor'))
+print(mesh.shape())
+>> OrderedDict([('data', 2), ('fsdp', 4), ('tensor', 1)])
+
+```
+
+
+### مواصفات التقسيم
+
+partition_spec لها نفس الرتبة مثل تنسور الإدخال. يصف كل بُعد كيف يتم تشظية البعد المقابل لتنسور الإدخال عبر شبكة الأجهزة (التي تحددها منطقيًا mesh_shape). `partition_spec` عبارة عن مجموعة من فهرس `device_mesh` dimension `index` أو None. يمكن أن يكون الفهرس `int` أو `str`، إذا كان للمحور المقابل للشبكة اسم. يحدد هذا كيفية تشظية كل رتبة إدخال (`index` إلى `mesh_shape`) أو تكرارها (`None`).
+
+```py
+# تقديم أسماء محاور الشبكة الاختيارية واستخدامها في مواصفات التقسيم
+mesh = Mesh(device_ids، (4، 2)، ('data', 'model'))
+partition_spec = ('model', 'data')
+xs.mark_sharding(input_tensor، mesh، partition_spec)
+
+```
+
+
+ندعم جميع أنواع التشظية الثلاثة، الموضحة في ورقة [GSPMD](https://arxiv.org/abs/2105.04663) الأصلية. على سبيل المثال، يمكنك تحديد التكرار الجزئي مثل هذا:
+
+```py
+# Provide optional mesh axis names and use them in the partition spec
+mesh = Mesh(device_ids, (2, 2, 2), ('x', 'y', 'z'))
+
+# evenly shard across x and z and replicate among y
+partition_spec = ('x', 'z')  # equivalent to ('x', None, 'z')
+xs.mark_sharding(input_tensor, mesh, partition_spec)
+
+
+```
+
+
+تمكّن مواصفات التقسيم من إعادة استخدام نفس الشبكة لأشكال تنسور المختلفة واستراتيجيات التشظية المرغوبة. يوضح المثال التالي ذلك باستخدام شبكة 3D:
+
+```py
+# إنشاء شبكة 3D من 8 أجهزة مع أبعاد منطقية replica وfsdp و
+# tensor
+mesh = Mesh(device_ids, (2, 2, 2), ('replica', 'fsdp', 'tensor'))
+
+# يمكن تشظية تنسور ثنائي الأبعاد على طول محوري fsdp وtensor وتكراره
+# على طول محور النسخة عن طريق حذف `replica` من مواصفات التقسيم.
+two_d_partially_replicated = torch.randn(64, 64, device='xla')
+xs.mark_sharding(two_d_partially_replicated، mesh، ('fsdp', 'tensor'))
+
+# يمكن تشظية تنسور ثنائي الأبعاد عبر جميع الأبعاد عن طريق الجمع، على سبيل المثال،
+# محاور النسخة والشبكة fsdp باستخدام مجموعة
+two_d_fully_sharded = torch.randn(64, 64, device='xla')
+xs.mark_sharding(two_d_fully_sharded، mesh، (('replica', 'fsdp'), 'tensor'))
+
+# يمكن تشظية تنسور رباعي الأبعاد عبر ثلاثة من محاوره كحد أقصى باستخدام شبكة 3D
+four_d = torch.randn(64, 64, 64, 64، device='xla')
+xs.mark_sharding(four_d، ('replica', 'fsdp', None، 'tensor'))
+
+```
+
+
+### XLAShardedTensor
+
+تتمثل حالة الاستخدام الرئيسية لـ `XLAShardedTensor` \[[RFC](https://github.com/pytorch/xla/issues/3871)\] في وضع علامات على `torch.tensor` الأصلي (على جهاز واحد) باستخدام مواصفات التشظية. يحدث وضع العلامات على الفور، ولكن التشظية الفعلية للتنسور يتم تأجيلها نظرًا لأن الحساب يتم تنفيذه بشكل كسول، باستثناء تنسورات الإدخال التي يتم تشظيها دون تأخير. بمجرد وضع علامة على تنسور وإحاطته داخل `XLAShardedTensor`، يمكن تمريره إلى عمليات PyTorch الأصلية و`nn.Module` الطبقات كـ `torch.Tensor`. هذا أمر مهم لضمان أن الطبقات الأصلية لـ PyTorch وops tensor يمكن تكديسها مع `XLAShardedTensor`. وهذا يعني أن المستخدم ليس بحاجة إلى إعادة كتابة عمليات النموذج والرمز الأصلية للحساب المجزأ. على وجه التحديد، `XLAShardedTensor` ستفي بالمتطلبات التالية:
+
+*   `XLAShardedTensor` هو `torch.Tensor` فئة فرعية ويعمل مباشرة مع عمليات torch الأصلية و`module.layers`. نستخدم `__torch_dispatch__` لإرسال `XLAShardedTensor` إلى backend XLA. يسترد PyTorch/XLA علامات التشظية المرفقة لتتبع الرسم البياني واستدعاء XLA SPMDPartitioner.
+    
+*   داخليًا، يتم دعم `XLAShardedTensor` (وglobal_tensor الإدخال الخاص به) بواسطة `XLATensor` بهيكل بيانات خاص يحتفظ بالإشارات إلى بيانات الشريحة على الجهاز.
+    
+*   قد يتم جمع التنسور المجزأ بعد التنفيذ الكسول وإعادته إلى المضيف كـ global_tensor عند الطلب على المضيف (على سبيل المثال، printقيمة global tensor.
+    
+*   يتم ملموسة مقابض الشرائح المحلية بشكل صارم بعد التنفيذ الكسول. `XLAShardedTensor` يكشف [local_shards](https://github.com/pytorch/xla/blob/4e8e5511555073ce8b6d1a436bf808c9333dcac6/torch_xla/distributed/spmd/xla_sharded_tensor.py#L117) لإرجاع الشرائح المحلية على الأجهزة القابلة للتعنون كـقائمة [XLAShard](https://github.com/pytorch/xla/blob/4e8e5511555073ce8b6d1a436bf808c9333dcac6/torch_xla/distributed/spmd/xla_sharded_tensor.py#L12).
+    
+
+هناك أيضًا جهد مستمر لدمج `XLAShardedTensor` في واجهة برمجة تطبيقات `DistributedTensor` لدعم backend XLA \[[RFC](https://github.com/pytorch/pytorch/issues/92909)\].
+
+### تكامل DTensor
+
+أصدرت PyTorch نسخة تجريبية من [DTensor](https://github.com/pytorch/pytorch/blob/main/torch/distributed/_tensor/README.md) في 2.1. نقوم بدمج PyTorch/XLA SPMD في واجهة برمجة تطبيقات DTensor [RFC](https://github.com/pytorch/pytorch/issues/92909). لدينا تكامل مفهومي لـ `distribute_tensor`، والذي يستدعي واجهة برمجة تطبيقات علامة التشظية `mark_sharding` لتشظية تنسور وحسابه باستخدام XLA:
+
+```py
+import torch
+from torch.distributed import DeviceMesh, Shard, distribute_tensor
+
+# الآن يعمل distribute_tensor مع backend `xla` باستخدام PyTorch/XLA SPMD.
+mesh = DeviceMesh("xla"، list(range(world_size)))
+big_tensor = torch.randn(100000, 88)
+my_dtensor = distribute_tensor(big_tensor، mesh، [Shard(0)])
+
+```
+
+
+هذه الميزة تجريبية، لذا يرجى الانتظار للحصول على مزيد من التحديثات والأمثلة والبرامج التعليمية في الإصدارات القادمة.
+
+### تحميل البيانات المتوافق مع التشظية من المضيف إلى الجهاز
+
+تأخذ PyTorch/XLA SPMD برنامجًا أحادي الجهاز، وتجزئته وتنفيذه بشكل متوازٍ. يتطلب التنفيذ SPMD استخدام PyTorch الأصلي DataLoader، والذي ينقل البيانات بشكل متزامن من المضيف إلى أجهزة XLA. هذا يمنع التدريب أثناء نقل بيانات الإدخال في كل خطوة. لتحسين أداء تحميل البيانات الأصلية، جعلنا PyTorch/XLA ParallelLoader يدعم التشظية المباشرة للإدخال (src)، عند تمرير kwarg الاختياري \_input_sharding_:
+
+```py
+# MpDeviceLoader returns ParallelLoader.per_device_loader as iterator
+train_loader = pl.MpDeviceLoader(
+         train_loader,  # wraps PyTorch DataLoader
+         device,
+      # optional input_sharding field
+         input_sharding=xs.ShardingSpec(input_mesh, (0, 1, 2, 3)))
+
+```
+
+
+### نقاط التفتيش الموزعة
+
+يتوافق PyTorch/XLA SPMD مع مكتبة [torch.distributed.checkpoint](https://pytorch.org/docs/stable/distributed.checkpoint.html) من خلال مثيل `Planner` مخصص. يمكن للمستخدمين حفظ نقاط التفتيش وتحميلها بشكل متزامن من خلال هذه الواجهة المشتركة.
+
+تمكّن فئات SPMDSavePlanner وSPMDLoadPlanner ([src](https://github.com/pytorch/xla/blob/master/torch_xla/experimental/distributed_checkpoint.py)) وظائف `save` و`load` من العمل مباشرة على شرائح `XLAShardedTensor`، مما يمكّن جميع مزايا نقاط التفتيش الموزعة في التدريب SPMD.
+
+فيما يلي توضيح لواجهة برمجة التطبيقات لنقاط التفتيش الموزعة المتزامنة:
+
+```py
+import torch.distributed.checkpoint as dist_cp
+import torch_xla.experimental.distributed_checkpoint as xc
+
+# حفظ state_dict
+state_dict = {
+    "model": model.state_dict()،
+    "optim": optim.state_dict()،
+}
+
+dist_cp.save(
+    state_dict=state_dict،
+    storage_writer=dist_cp.FileSystemWriter(CHECKPOINT_DIR)،
+    planner=xc.SPMDSavePlanner()،
+)
+...
+
+# تحميل حالة النموذج من نقطة التفتيش. يجب أن يكون النموذج
+# بالفعل على جهاز XLA ولديه التشظية المطلوبة.
+state_dict = {
+    "model": model.state_dict()،
+}
+
+dist_cp.load(
+    state_dict=state_dict،
+    storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR)،
+    planner=xc.SPMDLoadPlanner()،
+)
+model.load_state_dict(state_dict["model"])
+
+```
+
+
+#### CheckpointManager
+
+توفر واجهة برمجة التطبيقات التجريبية [CheckpointManager](https://github.com/pytorch/xla/blob/master/torch_xla/experimental/distributed_checkpoint/manager.py#L40) واجهة برمجة تطبيقات عالية المستوى فوق وظائف `torch.distributed.checkpoint` لتمكين بعض الميزات الرئيسية:
+
+*   **نقاط التفتيش المُدارة**: يتم تحديد كل نقطة تفتيش يتم إجراؤها بواسطة `CheckpointManager` بواسطة الخطوة التي تم فيها إجراء نقطة التفتيش. يمكن الوصول إلى جميع الخطوات التي يتم تتبعها من خلال طريقة `CheckpointManager.all_steps`، ويمكن استعادة أي خطوات يتم تتبعها باستخدام `CheckpointManager.restore`.
+    
+*   **نقاط التفتيش غير المتزامنة**: يتم كتابة نقاط التفتيش التي يتم إجراؤها من خلال واجهة برمجة التطبيقات `CheckpointManager.save_async` بشكل غير متزامن في التخزين الدائم لإلغاء حظر التدريب لمدة فترة نقطة التفتيش. يتم أولاً نقل حالة التجزئة المدخلة إلى وحدة المعالجة المركزية قبل إرسال نقطة التفتيش إلى مؤشر ترابط الخلفية.
+    
+*   **النقاط المرجعية التلقائية عند الاستيلاء**: يمكن اكتشاف عمليات الاستيلاء على Cloud TPU واتخاذ نقطة تفتيش قبل إنهاء العملية. لاستخدامها، تأكد من توفير TPU الخاص بك من خلال مورد في قائمة الانتظار مع [تمكين نقاط التفتيش التلقائية](https://cloud.google.com/sdk/gcloud/reference/alpha/compute/tpus/queued-resources/create#--autocheckpoint-enabled)، وتأكد من تعيين المعلمة `chkpt_on_preemption` عند إنشاء CheckpointManager (هذا الخيار ممكّن بشكل افتراضي).
+    
+*   **دعم FSSpec**: يستخدم `CheckpointManager` backend fsspec لتمكين نقاط التفتيش مباشرة إلى أي نظام ملفات متوافق مع fsspec، بما في ذلك GCS.
+    
+
+مثال على استخدام CheckpointManager هو أدناه:
+
+```py
+from torch_xla.experimental.distributed_checkpoint import CheckpointManager
+
+# Create a CheckpointManager to checkpoint every 10 steps into GCS.
+chkpt_mgr = CheckpointManager('gs://my-bucket/my-experiment', 10)
+
+# Select a checkpoint to restore from, and restore if applicable
+tracked_steps = chkpt_mgr.all_steps()
+if tracked_steps:
+    # Choose the highest step
+    best_step = max(tracked_steps)
+    state_dict = {'model': model.state_dict()}
+    chkpt_mgr.restore(best_step, state_dict)
+    model.load_state_dict(state_dict['model'])
+
+# Call `save` or `save_async` every step within the train loop. These methods
+# return True when a checkpoint is taken.
+for step, data in enumerate(dataloader):
+    ...
+    state_dict = {'model': model.state_dict(), 'optim': optim.state_dict()}
+    if chkpt_mgr.save_async(step, state_dict):
+        print(f'Checkpoint taken at step {step}')
+
+```
+
+
+### مجموعات العمليات
+
+لاستخدام واجهات برمجة التطبيقات `torch.distributed` مثل نقاط التفتيش الموزعة، مطلوب مجموعة عمليات. في وضع SPMD، لا يتم دعم backend `xla` نظرًا لأن المترجم مسؤول عن جميع المجموعات.
+
+بدلاً من ذلك، يجب استخدام مجموعة عمليات CPU مثل `gloo`. على وحدات معالجة الرسوميات، يتم دعم طريقة init_method `xla://` لاكتشاف عنوان IP الرئيسي وحجم العالم العالمي ورتبة المضيف. مثال على التهيئة هو أدناه:
+
+```py
+import torch.distributed as dist
+# Import to register the `xla://` init_method
+import torch_xla.distributed.xla_backend
+import torch_xla.runtime as xr
+
+xr.use_spmd()
+
+# The `xla://` init_method will automatically discover master worker IP, rank,
+# and global world size without requiring environment configuration on TPUs.
+dist.init_process_group('gloo', init_method='xla://')
+
+```
+
+### تحسين الجهاز الظاهري
+
+عادةً ما ينقل PyTorch/XLA بيانات المصفوفة بشكل غير متزامر من المضيف إلى الجهاز بمجرد تحديد المصفوفة. وذلك لتداخل نقل البيانات مع وقت تتبع الرسم البياني. ومع ذلك، نظرًا لأن GSPMD يسمح للمستخدم بتعديل تجزئة المصفوفة بعد تحديد المصفوفة، فإننا نحتاج إلى تحسين لمنع النقل غير الضروري لبيانات المصفوفة ذهابًا وإيابًا بين المضيف والجهاز. نقدم تحسين جهاز ظاهري، وهي تقنية لوضع بيانات المصفوفة على جهاز ظاهري SPMD:0 أولاً، قبل تحميلها على الأجهزة الفعلية عندما يتم الانتهاء من جميع قرارات التجزئة. يتم وضع كل بيانات المصفوفة في وضع SPMD على جهاز ظاهري، SPMD:0. يتم عرض الجهاز الظاهري على المستخدم كجهاز XLA XLA:0 مع الشرائح الفعلية على الأجهزة الفعلية، مثل TPU:0 وTPU:1، وما إلى ذلك.
+
+### عدد العمليات
+
+على عكس DDP وFSDP الموجودين، يوجد دائمًا في وضع SPMD عملية واحدة تعمل على كل مضيف معجل. يوفر هذا ميزة أن PyTorch/XLA بحاجة فقط إلى تجميع كل رسم بياني مرة واحدة والتي يمكن إعادة استخدامها لجميع المعجلات المرفقة بهذا المضيف.
+
+### تشغيل SPMD على TPU Pod
+
+لا يلزم إجراء أي تغيير في التعليمات البرمجية للانتقال من مضيف TPU واحد إلى TPU Pod إذا كنت تقوم ببناء شبكة ومحدد قسم الخاص بك بناءً على عدد الأجهزة بدلاً من بعض الثوابت المرمزة ثابتة. لتشغيل عبء عمل PyTorch/XLA على TPU Pod، يرجى الرجوع إلى قسم [Pods](https://github.com/pytorch/xla/blob/master/docs/pjrt.md#pods) في دليل PJRT الخاص بنا.
+
+### تشغيل SPMD على GPU
+
+يدعم PyTorch/XLA SPMD على GPU NVIDIA (عقدة واحدة أو متعددة). يظل نص البرنامج النصي للتدريب/الاستدلال كما هو المستخدم لجهاز TPU، مثل نص [برنامج ResNet](https://github.com/pytorch/xla/blob/1dc78948c0c9d018d8d0d2b4cce912552ab27083/test/spmd/test_train_spmd_imagenet.py) النصي هذا. لتنفيذ البرنامج النصي باستخدام SPMD، نستخدم `torchrun`:
+
+```bash
+PJRT_DEVICE=CUDA \
+torchrun \
+--nnodes=${NUM_GPU_MACHINES} \
+--node_rank=${RANK_OF_CURRENT_MACHINE} \
+--nproc_per_node=1 \
+--rdzv_endpoint="<MACHINE_0_IP_ADDRESS>:<PORT>" \
+training_or_inference_script_using_spmd.py
+
+```
+
+*   `--nnodes`: عدد أجهزة GPU التي سيتم استخدامها.
+    
+*   `--node_rank`: فهرس أجهزة GPU الحالية. يمكن أن تكون القيمة 0 أو 1 أو ... أو ${NUMBER\_GPU\_VM}-1.
+    
+*   `--nproc_per_node`: يجب أن تكون القيمة 1 بسبب متطلبات SPMD.
+    
+*   `--rdzv_endpoint`: نقطة نهاية جهاز GPU مع node_rank==0، على شكل host:port. سيكون المضيف هو عنوان IP الداخلي. يمكن أن يكون المنفذ أي منفذ متاح على الجهاز. بالنسبة للتدريب/الاستدلال أحادي العقدة، يمكن إغفال هذا المعلمة.
+    
+
+على سبيل المثال، إذا كنت تريد تدريب نموذج ResNet على آلتين GPU باستخدام SPMD، فيمكنك تشغيل البرنامج النصي أدناه على الآلة الأولى:
+
+```bash
+XLA_USE_SPMD=1 PJRT_DEVICE=CUDA \
+torchrun \
+--nnodes=2 \
+--node_rank=0 \
+--nproc_per_node=1 \
+--rdzv_endpoint="<MACHINE_0_INTERNAL_IP_ADDRESS>:12355" \
+pytorch/xla/test/spmd/test_train_spmd_imagenet.py --fake_data --batch_size 128
+
+```
+
+وقم بتشغيل ما يلي على الآلة الثانية:
+
+```bash
+XLA_USE_SPMD=1 PJRT_DEVICE=CUDA \
+torchrun \
+--nnodes=2 \
+--node_rank=1 \
+--nproc_per_node=1 \
+--rdzv_endpoint="<MACHINE_0_INTERNAL_IP_ADDRESS>:12355" \
+pytorch/xla/test/spmd/test_train_spmd_imagenet.py --fake_data --batch_size 128
+
+```
+
+لمزيد من المعلومات، يرجى الرجوع إلى [SPMD support on GPU RFC](https://github.com/pytorch/xla/issues/6256).
+
+أمثلة مرجعية
+----------------------------------------------------------------------
+
+### استخدام SPMD للتعبير عن التوازي في البيانات
+
+واجهة برمجة التطبيقات SPMD عامة بما يكفي للتعبير عن كل من التوازي في البيانات والتوازي في النموذج. يمكن للمستخدم تنفيذ التوازي في البيانات ببساطة عن طريق وضع علامة على بعد الدفعة للتجزئة. هنا، قمنا بتجزئة بعد الدفعة عبر جميع الأجهزة المتاحة (N-way): هناك طريقتان لاستخدام SPMD للتعبير عن التوازي في البيانات أو تجزئة الدفعات:
+
+```py
+num_devices = xr.global_runtime_device_count()
+
+# افترض أن البيانات ذات أبعاد 4 وأن البعد 0 هو بعد الدفعة
+mesh_shape = (num_devices, 1, 1, 1)
+input_mesh = xs.Mesh(device_ids, mesh_shape, ('B', 'C', 'W', 'H'))
+partition_spec = range(num_devices)
+
+# تجزئة بعد الدفعة
+xs.mark_sharding(input_tensor, input_mesh, partition_spec)
+
+```
+
+تدعم PyTorch/XLA MpDeviceLoader تجزئة دفعات الإدخال، والتي تقوم أيضًا بتحميل الدفعات إلى الأجهزة في الخلفية:
+
+```py
+num_devices = xr.global_runtime_device_count()
+
+# افترض أن البيانات ذات أبعاد 4 وأن البعد 0 هو بعد الدفعة
+mesh_shape = (num_devices, 1, 1, 1)
+input_mesh = xs.Mesh(device_ids, mesh_shape, ('B', 'C', 'W', 'H'))
+partition_spec = range(num_devices)
+
+# استخدم MpDeviceLoader لتحميل البيانات في الخلفية
+train_loader = pl.MpDeviceLoader(
+     train_loader,
+     device,
+     input_sharding=xs.ShardingSpec(input_mesh, partition_spec))
+
+```
+
+نوصي بشدة بالنهج الثاني لأنه يجب أن يؤدي إلى أداء تدريب أفضل.
+
+### استخدام SPMD للتعبير عن FSDP (التوازي الكامل في البيانات)
+
+FSDP في PyTorch هو التوازي في البيانات + تجزئة معلمات النموذج في البعد 0. يجب على المستخدمين أولاً استخدام SPMD للتعبير عن التوازي في البيانات كما هو مقترح في القسم السابق.
+
+```py
+for name, param in model.named_parameters():
+    shape = (num_devices,) + (1,) * (len(param.shape) - 1)
+    mesh = xs.Mesh(device_ids, shape)
+    xs.mark_sharding(param, mesh, range(len(param.shape)))
+
+```
+
+### تشغيل مثال Resnet50 باستخدام SPMD
+
+قدمنا مثالًا سريعًا عن [resnet50](https://github.com/pytorch/xla/blob/master/test/spmd/test_train_spmd_imagenet.py) مع بعض استراتيجيات التجزئة SPMD المختلفة للعب بها. يمكنك أولاً تشغيله بدون SPMD باستخدام
+
+```bash
+python test/spmd/test_train_spmd_imagenet.py --fake_data --batch_size 512
+
+```
+
+والتحقق من الإنتاجية. بعد ذلك، يمكنك تمكين تجزئة الدفعات باستخدام
+
+```bash
+XLA_USE_SPMD=1 python test/spmd/test_train_spmd_imagenet.py --fake_data --batch_size 2048 --model=resnet50 --sharding=batch
+
+```
+
+لاحظ أنني استخدمت حجم دفعة أكبر بأربع مرات حيث أقوم بتشغيله على TPU v4 الذي يحتوي على 4 أجهزة TPU متصلة به. يجب أن ترى أن الإنتاجية أصبحت حوالي 4 أضعاف التشغيل بدون SPMD.
+
+هنا، شبكة mesh عبارة عن شبكة mesh 2x2 مع المحاور "x" و"y"
+-------------------------------------------------------------------------------------------------------------------------
+
+```py
+t = torch.randn(8, 4, device='xla') xs.mark\_sharding(t, mesh, ('x', 'y'))
+```
+
+يمكن تصور تجزئة المصفوفة باستخدام طريقة `visualize_tensor_sharding`
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+```py
+from torch_xla.distributed.spmd.debugging import visualize_tensor_sharding
+generated_table = visualize_tensor_sharding(t, use\_color=False)
+
+```
+
+![alt_text](assets/spmd_debug_1.png "visualize_tensor_sharding example on TPU v4-8(single-host)")
+- Code snippet used `visualize_sharding` and visualization result:
+
+```python
+from torch_xla.distributed.spmd.debugging import visualize_sharding
+sharding = '{devices=[2,2]0,1,2,3}'
+generated_table = visualize_sharding(sharding, use_color=False)
+
+```
+
+
+[![alt_text](https://pytorch.org/xla/release/2.3/assets/spmd_debug_2.png)](https://pytorch.org/xla/release/2.3/assets/spmd_debug_2.png)
+
+يمكنك استخدام هذه الأمثلة على TPU/GPU/CPU ذات المضيف الواحد وتعديلها للتشغيل على مضيفين متعددين. ويمكنك تعديلها لأسلوب التجزئة "tiled" و"partial_replication" و"replicated".
+
+نقدم ميزة PyTorch/XLA SPMD جديدة تسمى `auto-sharding`، [RFC](https://github.com/pytorch/xla/issues/6322). هذه ميزة تجريبية في `r2.3` و`nightly`، والتي تدعم `XLA:TPU` ومضيف TPUVM واحد.
+
+يمكن تمكين التجزئة التلقائية لـ PyTorch/XLA بإحدى الطرق التالية:
+
+*   تعيين متغير البيئة `XLA_SPMD_AUTO=1`
+    
+*   استدعاء واجهة برمجة تطبيقات SPMD في بداية الكود الخاص بك: .. code-block:: python
+    
+    > import torch\_xla.runtime as xr xr.use\_spmd(auto=True)
+    
+*   استدعاء `pytorch.distributed._tensor.distribute_module` مع `auto-policy` و`xla`: [\`](#id40) [\`](#id42)
+
+```python 
+import torch_xla.runtime as xr from torch.distributed._tensor 
+import DeviceMesh, distribute_module from torch_xla.distributed.spmd 
+import auto_policy
+    
+
+device_count = xr.global_runtime_device_count() 
+device_mesh = DeviceMesh("xla"، list(range(device_count)))
+```
+
+حاليًا، يجب تحميل النموذج على جهاز XLA عبر distribute_module.
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+```py
+model = MyModule() # nn.module s
+harded_model = distribute_module(model, device_mesh, auto_policy) 
+```
+
+يمكنك، بشكل اختياري، تعيين خيارات/متغيرات بيئة التالية للتحكم في سلوك تمريرة التجزئة التلقائية المستندة إلى XLA:
+
+*   `XLA_AUTO_USE_GROUP_SHARDING`: تجزئة إعادة تجميع المعلمات. تم الإعداد بشكل افتراضي.
+    
+*   `XLA_AUTO_SPMD_MESH`: شكل شبكة mesh المنطقية التي سيتم استخدامها للتجزئة التلقائية. على سبيل المثال، `XLA_AUTO_SPMD_MESH=2,2` يقابل شبكة mesh 2x2 مع 4 أجهزة عالمية. إذا لم يتم تعيينه، فسيتم استخدام شكل شبكة جهاز افتراضي 'num_devices,1'.
+    
+
+التوازي الكامل في البيانات عبر SPMD
+----------------------------------------------------------------------------------------------------------
+
+التوازي الكامل في البيانات عبر SPMD أو FSDPv2 هو أداة مساعدة تعيد التعبير عن خوارزمية FSDP الشهيرة في SPMD. [هذا](https://github.com/pytorch/xla/blob/master/torch_xla/experimental/spmd_fully_sharded_data_parallel.py) هي ميزة تجريبية تهدف إلى تقديم واجهة مألوفة للمستخدمين للاستفادة من جميع المزايا التي تجلبها SPMD إلى الطاولة. توجد وثيقة التصميم [هنا](https://github.com/pytorch/xla/issues/6379).
+
+يرجى مراجعة [دليل المستخدم SPMD](https://pytorch.org/xla/release/2.3/spmd.md) قبل المتابعة.
+
+مثال الاستخدام:
+
+```py
+import torch
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.spmd as xs
+from torch_xla.experimental.spmd_fully_sharded_data_parallel import SpmdFullyShardedDataParallel as FSDPv2
+
+# حدد شبكة mesh باتباع الممارسة الشائعة لـ SPMD
+num_devices = xr.global_runtime_device_count()
+mesh_shape = (num_devices, 1)
+device_ids = np.array(range(num_devices))
+# يجب ملاحظة أن شبكة mesh يجب أن يكون لها محور يسمى 'fsdp'، والذي سيتم تجزئة الأوزان والتنشيط عليه.
+mesh = Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
+
+# تجزئة الإدخال، وافترض أن x عبارة عن مصفوفة ثنائية الأبعاد.
+x = xs.mark_sharding(x, mesh, ('fsdp', None))
+
+# كما هو الحال في FSDP العادي، ولكن هناك حاجة إلى شبكة mesh إضافية.
+model = FSDPv2(my_module, mesh)
+optim = torch.optim.Adam(model.parameters(), lr=0.0001)
+output = model(x, y)
+loss = output.sum()
+loss.backward()
+optim.step()
+
+```
+
+من الممكن أيضًا تجزئة طبقات فردية بشكل منفصل وإحاطة أي معلمات متبقية. ستأتي ميزة التغليف التلقائي في الإصدارات المستقبلية.
+
+تجزئة الإخراج
+----------------------------------------------------------------
+
+لضمان تنفيذ مترجم XLA لخوارزمية FSDP بشكل صحيح، نحتاج إلى تجزئة الأوزان والتنشيطات. وهذا يعني تجزئة إخراج طريقة forward. نظرًا لأن إخراج الدالة forward يمكن أن يختلف، فإننا نقدم shard_output لتجزئة التنشيط في الحالات التي لا يقع فيها إخراج الوحدة النمطية ضمن إحدى هذه الفئات:
+
+1.  مصفوفة واحدة
+    
+2.  مجموعة من المصفوفات حيث العنصر 0 هو التنشيط.
+    
+
+مثال الاستخدام:
+
+```py
+def shard_output(output, mesh):
+    xs.mark_sharding(output.logits, mesh, ('fsdp', None, None))
+
+model = FSDPv2(my_module, mesh, shard_output)
+
+```
+
+الاحتفاظ بنقطة التفتيش للمتدرج
+------------------------------------------------------------
+
+حاليًا، يجب تطبيق الاحتفاظ بنقطة التفتيش للمتدرج على الوحدة النمطية قبل غلاف FSDP. وإلا، فإن التكرار بشكل متكرر في الوحدات النمطية الفرعية سينتهي بحلقة لا نهائية. سنقوم بإصلاح هذه المشكلة في الإصدارات المستقبلية.
+
+مثال الاستخدام:
+
+```py
+from torch_xla.distributed.fsdp import checkpoint_module
+
+model = FSDPv2(checkpoint_module(my_module), mesh)
+
+```
+
+مثال Llama 2 من HuggingFace
+----------------------------------------------------------------------------------------
+
+لدينا نسخة متفرعة من HF Llama 2 لإظهار تكامل محتمل [هنا](https://github.com/huggingface/transformers/compare/main...pytorch-tpu:transformers:llama2-spmd-fsdp).
